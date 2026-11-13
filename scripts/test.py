@@ -373,6 +373,8 @@ def save_results(
 def main():
     # Must set spawn method before any CUDA operations for DataLoader workers
     mp.set_start_method('spawn', force=True)
+    # Use file system sharing strategy to avoid shared memory limits with CUDA tensors
+    torch.multiprocessing.set_sharing_strategy('file_system')
 
     args = parse_args()
 
