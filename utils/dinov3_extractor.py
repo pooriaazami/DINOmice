@@ -42,11 +42,11 @@ class DINOv3Extractor:
         Extract normalized patch features from a single frame.
 
         Args:
-            frame: H x W x 3 (RGB) or H x W (grayscale) numpy array
+            frame: H x W x 3 (RGB) numpy array (already converted to 3-channel if needed)
         Returns:
             patch_features: H_p x W_p x D tensor (normalized)
         """
-        # Ensure RGB
+        # Handle grayscale input (convert to 3-channel)
         if frame.ndim == 2:
             frame = np.repeat(frame[..., None], 3, axis=-1)
         elif frame.shape[2] == 4:
@@ -55,7 +55,7 @@ class DINOv3Extractor:
         # Convert to PIL
         image = Image.fromarray(frame.astype(np.uint8))
 
-        # Process
+        # Process - processor handles resizing and normalization
         inputs = self.processor(images=image, return_tensors="pt")
         pixel_values = inputs["pixel_values"].to(self.device)
 
@@ -80,15 +80,16 @@ class DINOv3Extractor:
         self,
         video_path: str,
         frame_indices: Optional[List[int]] = None,
-        sample_rate: int = 1
+        sample_rate: int = 100
     ) -> Tuple[torch.Tensor, List[int]]:
         """
         Extract features from video frames.
+        Matches notebook: sample every N frames, convert to grayscale then 3-channel RGB.
 
         Args:
             video_path: Path to video file
             frame_indices: Specific frame indices to extract (optional)
-            sample_rate: Sample every N frames (if frame_indices not provided)
+            sample_rate: Sample every N frames (if frame_indices not provided). Default 100 as in notebook.
         Returns:
             features: T x H_p x W_p x D tensor
             extracted_indices: List of frame indices that were extracted
@@ -108,8 +109,12 @@ class DINOv3Extractor:
             if not ret:
                 continue
 
-            # Convert BGR to RGB
+            # Convert BGR to RGB then to Grayscale (as in notebook)
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+
+            # Grayscale -> 3-channel RGB by repeating (as in notebook)
+            frame = np.repeat(frame[..., None], 3, axis=-1)
 
             features = self.extract_frame_features(frame)
             features_list.append(features)
@@ -123,13 +128,6 @@ class DINOv3Extractor:
             features = torch.empty(0)
 
         return features, extracted_indices
-
-    def get_patch_grid_size(self, image_size: Tuple[int, int] = (224, 224)) -> Tuple[int, int]:
-        """Get patch grid dimensions for given image size."""
-        H, W = image_size
-        H_p = H // self.patch_size
-        W_p = W // self.patch_size
-        return H_p, W_p
 
 
 def compute_similarity(
@@ -291,8 +289,9 @@ if __name__ == "__main__":
     # Test feature extraction
     extractor = DINOv3Extractor()
 
-    # Create dummy frame
-    dummy_frame = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
+    # Create dummy frame (grayscale -> 3-channel as in notebook)
+    dummy_gray = np.random.randint(0, 255, (224, 224), dtype=np.uint8)
+    dummy_frame = np.repeat(dummy_gray[..., None], 3, axis=-1)
     features = extractor.extract_frame_features(dummy_frame)
     print(f"Frame features shape: {features.shape}")  # Should be (14, 14, 768)
 
