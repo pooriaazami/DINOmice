@@ -31,6 +31,7 @@ from typing import List, Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import f1_score, classification_report
 import numpy as np
@@ -305,6 +306,9 @@ def save_checkpoint(
 
 
 def main():
+    # Must set spawn method before any CUDA operations for DataLoader workers
+    mp.set_start_method('spawn', force=True)
+
     args = parse_args()
 
     # Load and merge config

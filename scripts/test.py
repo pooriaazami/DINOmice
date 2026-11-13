@@ -25,6 +25,7 @@ import sys
 import yaml
 import json
 import time
+import torch.multiprocessing as mp
 from pathlib import Path
 from typing import List, Dict, Tuple
 
@@ -370,6 +371,9 @@ def save_results(
 
 
 def main():
+    # Must set spawn method before any CUDA operations for DataLoader workers
+    mp.set_start_method('spawn', force=True)
+
     args = parse_args()
 
     # Load and merge config
