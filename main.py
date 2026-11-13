@@ -3,6 +3,14 @@
 Main entry point for DINOv3-based Behavior Classification Pipeline.
 
 This script provides a unified CLI for training, testing, and prediction.
+
+Usage (new JSON config approach):
+    python main.py train --config configs/behaviors.yaml --data_config configs/data_config.json --output_dir outputs/exp1
+    python main.py test --checkpoint outputs/exp1/checkpoint_best.pth --config configs/behaviors.yaml --data_config configs/data_config.json --output_dir outputs/test_results
+    python main.py predict --checkpoint outputs/exp1/checkpoint_best.pth --config configs/behaviors.yaml --data_config configs/data_config.json --output_dir outputs/predictions
+
+Usage (legacy approach):
+    python main.py train --config configs/behaviors.yaml --train_videos data/v1.mp4 data/v2.mp4 --train_labels data/l1.json data/l2.json --val_videos data/val.mp4 --val_labels data/val_labels.json --output_dir outputs/exp1
 """
 
 import argparse
@@ -15,13 +23,32 @@ def main():
         description='DINOv3-based Behavior Classification Pipeline',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
+Examples (new JSON config approach - RECOMMENDED):
+  # Train
+  python main.py train --config configs/behaviors.yaml \\
+      --data_config configs/data_config.json \\
+      --output_dir outputs/exp1
+
+  # Test
+  python main.py test --checkpoint outputs/exp1/checkpoint_best.pth \\
+      --config configs/behaviors.yaml \\
+      --data_config configs/data_config.json \\
+      --output_dir outputs/test_results
+
+  # Predict
+  python main.py predict --checkpoint outputs/exp1/checkpoint_best.pth \\
+      --config configs/behaviors.yaml \\
+      --data_config configs/data_config.json \\
+      --output_dir outputs/predictions
+
+Examples (legacy approach - single reference patch for all videos):
   # Train
   python main.py train --config configs/behaviors.yaml \\
       --train_videos data/v1.mp4 data/v2.mp4 \\
       --train_labels data/l1.json data/l2.json \\
       --val_videos data/val.mp4 \\
       --val_labels data/val_labels.json \\
+      --reference_patch 7 7 \\
       --output_dir outputs/exp1
 
   # Test
@@ -29,12 +56,14 @@ Examples:
       --config configs/behaviors.yaml \\
       --test_videos data/test.mp4 \\
       --test_labels data/test_labels.json \\
+      --reference_patch 7 7 \\
       --output_dir outputs/test_results
 
   # Predict
   python main.py predict --checkpoint outputs/exp1/checkpoint_best.pth \\
       --config configs/behaviors.yaml \\
       --videos data/new_video.mp4 \\
+      --reference_patch 7 7 \\
       --output_dir outputs/predictions
 """
     )
@@ -44,16 +73,24 @@ Examples:
     # Train command
     train_parser = subparsers.add_parser('train', help='Train the model')
     train_parser.add_argument('--config', type=str, default='configs/behaviors.yaml')
-    train_parser.add_argument('--train_videos', nargs='+', required=True)
-    train_parser.add_argument('--train_labels', nargs='+', required=True)
-    train_parser.add_argument('--val_videos', nargs='+', required=True)
-    train_parser.add_argument('--val_labels', nargs='+', required=True)
-    train_parser.add_argument('--reference_patch', nargs=2, type=int, default=[7, 7])
+    train_parser.add_argument('--data_config', type=str, default=None,
+                              help='Path to JSON data config file with train/val/test splits and per-video reference patches (RECOMMENDED)')
+    # Legacy args
+    train_parser.add_argument('--train_videos', nargs='+', default=None,
+                              help='Paths to training videos (legacy)')
+    train_parser.add_argument('--train_labels', nargs='+', default=None,
+                              help='Paths to training label files (legacy)')
+    train_parser.add_argument('--val_videos', nargs='+', default=None,
+                              help='Paths to validation videos (legacy)')
+    train_parser.add_argument('--val_labels', nargs='+', default=None,
+                              help='Paths to validation label files (legacy)')
+    train_parser.add_argument('--reference_patch', nargs=2, type=int, default=[7, 7],
+                              help='Reference patch coordinates (row col) - used for all videos in legacy mode')
     train_parser.add_argument('--window_size', type=int, default=None)
     train_parser.add_argument('--similarity_threshold', type=float, default=None)
     train_parser.add_argument('--border_size', type=int, default=None)
     train_parser.add_argument('--max_patches_per_frame', type=int, default=50)
-    train_parser.add_argument('--frame_sample_rate', type=int, default=1)
+    train_parser.add_argument('--frame_sample_rate', type=int, default=None)
     train_parser.add_argument('--batch_size', type=int, default=None)
     train_parser.add_argument('--learning_rate', type=float, default=None)
     train_parser.add_argument('--num_epochs', type=int, default=None)
@@ -71,14 +108,20 @@ Examples:
     test_parser = subparsers.add_parser('test', help='Test/evaluate the model')
     test_parser.add_argument('--checkpoint', type=str, required=True)
     test_parser.add_argument('--config', type=str, default='configs/behaviors.yaml')
-    test_parser.add_argument('--test_videos', nargs='+', required=True)
-    test_parser.add_argument('--test_labels', nargs='+', required=True)
-    test_parser.add_argument('--reference_patch', nargs=2, type=int, default=[7, 7])
+    test_parser.add_argument('--data_config', type=str, default=None,
+                             help='Path to JSON data config file with train/val/test splits and per-video reference patches (RECOMMENDED)')
+    # Legacy args
+    test_parser.add_argument('--test_videos', nargs='+', default=None,
+                             help='Paths to test videos (legacy)')
+    test_parser.add_argument('--test_labels', nargs='+', default=None,
+                             help='Paths to test label files (legacy)')
+    test_parser.add_argument('--reference_patch', nargs=2, type=int, default=[7, 7],
+                             help='Reference patch coordinates (row col) - used for all videos in legacy mode')
     test_parser.add_argument('--window_size', type=int, default=None)
     test_parser.add_argument('--similarity_threshold', type=float, default=None)
     test_parser.add_argument('--border_size', type=int, default=None)
     test_parser.add_argument('--max_patches_per_frame', type=int, default=50)
-    test_parser.add_argument('--frame_sample_rate', type=int, default=1)
+    test_parser.add_argument('--frame_sample_rate', type=int, default=None)
     test_parser.add_argument('--stride', type=int, default=1)
     test_parser.add_argument('--threshold', type=float, default=0.5)
     test_parser.add_argument('--batch_size', type=int, default=8)
@@ -91,13 +134,18 @@ Examples:
     pred_parser = subparsers.add_parser('predict', help='Predict on new videos')
     pred_parser.add_argument('--checkpoint', type=str, required=True)
     pred_parser.add_argument('--config', type=str, default='configs/behaviors.yaml')
-    pred_parser.add_argument('--videos', nargs='+', required=True)
-    pred_parser.add_argument('--reference_patch', nargs=2, type=int, default=[7, 7])
+    pred_parser.add_argument('--data_config', type=str, default=None,
+                             help='Path to JSON data config file with train/val/test splits and per-video reference patches (RECOMMENDED)')
+    # Legacy args
+    pred_parser.add_argument('--videos', nargs='+', default=None,
+                             help='Paths to videos for prediction (legacy)')
+    pred_parser.add_argument('--reference_patch', nargs=2, type=int, default=[7, 7],
+                             help='Reference patch coordinates (row col) - used for all videos in legacy mode')
     pred_parser.add_argument('--window_size', type=int, default=None)
     pred_parser.add_argument('--similarity_threshold', type=float, default=None)
     pred_parser.add_argument('--border_size', type=int, default=None)
     pred_parser.add_argument('--max_patches_per_frame', type=int, default=50)
-    pred_parser.add_argument('--frame_sample_rate', type=int, default=1)
+    pred_parser.add_argument('--frame_sample_rate', type=int, default=None)
     pred_parser.add_argument('--stride', type=int, default=1)
     pred_parser.add_argument('--threshold', type=float, default=0.5)
     pred_parser.add_argument('--batch_size', type=int, default=8)
@@ -115,7 +163,6 @@ Examples:
     # Import and run appropriate script
     if args.command == 'train':
         from scripts.train import main as train_main
-        # Convert args to sys.argv format for train.py
         sys.argv = ['train.py'] + _args_to_argv(args, 'train')
         train_main()
     elif args.command == 'test':
@@ -133,7 +180,7 @@ def _args_to_argv(args, command):
     argv = []
 
     # Common args
-    common_args = ['config', 'reference_patch', 'window_size', 'similarity_threshold',
+    common_args = ['config', 'data_config', 'reference_patch', 'window_size', 'similarity_threshold',
                    'border_size', 'max_patches_per_frame', 'frame_sample_rate',
                    'device', 'output_dir']
 

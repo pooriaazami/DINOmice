@@ -2,7 +2,13 @@
 """
 Training script for DINOv3-based Behavior Classification.
 
-Usage:
+Usage (new JSON config approach):
+    python scripts/train.py \
+        --config configs/behaviors.yaml \
+        --data_config configs/data_config.json \
+        --output_dir outputs/experiment1
+
+Usage (legacy approach - single reference patch for all videos):
     python scripts/train.py \
         --config configs/behaviors.yaml \
         --train_videos data/video1.mp4 data/video2.mp4 \
@@ -10,9 +16,6 @@ Usage:
         --val_videos data/val_video.mp4 \
         --val_labels data/val_labels.json \
         --reference_patch 7 7 \
-        --window_size 16 \
-        --similarity_threshold 0.8 \
-        --border_size 1 \
         --output_dir outputs/experiment1
 """
 
@@ -38,7 +41,8 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from models.behavior_classifier import BehaviorClassifier, create_model_from_config
 from utils.dinov3_extractor import DINOv3Extractor
-from utils.dataset import create_data_loaders, BehaviorDataset
+from utils.dataset import create_data_loaders_from_config, create_data_loaders
+from utils.data_config import load_data_config, create_data_config_from_lists
 
 
 def parse_args():
@@ -48,19 +52,23 @@ def parse_args():
     parser.add_argument('--config', type=str, default='configs/behaviors.yaml',
                         help='Path to config YAML file')
 
-    # Data
-    parser.add_argument('--train_videos', nargs='+', required=True,
-                        help='Paths to training videos')
-    parser.add_argument('--train_labels', nargs='+', required=True,
-                        help='Paths to training label files')
-    parser.add_argument('--val_videos', nargs='+', required=True,
-                        help='Paths to validation videos')
-    parser.add_argument('--val_labels', nargs='+', required=True,
-                        help='Paths to validation label files')
+    # Data (new JSON config approach)
+    parser.add_argument('--data_config', type=str, default=None,
+                        help='Path to JSON data config file with train/val/test splits and per-video reference patches')
+
+    # Data (legacy approach - for backward compatibility)
+    parser.add_argument('--train_videos', nargs='+', default=None,
+                        help='Paths to training videos (legacy)')
+    parser.add_argument('--train_labels', nargs='+', default=None,
+                        help='Paths to training label files (legacy)')
+    parser.add_argument('--val_videos', nargs='+', default=None,
+                        help='Paths to validation videos (legacy)')
+    parser.add_argument('--val_labels', nargs='+', default=None,
+                        help='Paths to validation label files (legacy)')
 
     # Model parameters (override config)
     parser.add_argument('--reference_patch', nargs=2, type=int, default=[7, 7],
-                        help='Reference patch coordinates (row col)')
+                        help='Reference patch coordinates (row col) - used for all videos in legacy mode')
     parser.add_argument('--window_size', type=int, default=None,
                         help='Temporal window size (frames)')
     parser.add_argument('--similarity_threshold', type=float, default=None,
@@ -69,8 +77,8 @@ def parse_args():
                         help='Border size around selected patches')
     parser.add_argument('--max_patches_per_frame', type=int, default=50,
                         help='Maximum patches per frame after padding')
-    parser.add_argument('--frame_sample_rate', type=int, default=1,
-                        help='Sample every N frames')
+    parser.add_argument('--frame_sample_rate', type=int, default=None,
+                        help='Sample every N frames (overrides config)')
 
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=None,
@@ -332,6 +340,51 @@ def main():
     model = create_model_from_config(args.config, num_behaviors).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
+    # Load data config
+    if args.data_config:
+        # New approach: load from JSON file
+        print(f"Loading data config from: {args.data_config}")
+        data_config = load_data_config(args.data_config)
+        print(f"  Train videos: {len(data_config.train)}")
+        print(f"  Val videos: {len(data_config.val)}")
+        print(f"  Test videos: {len(data_config.test)}")
+        for v in data_config.train:
+            print(f"    Train: {v.video_path} (ref: {v.reference_patch})")
+        for v in data_config.val:
+            print(f"    Val:   {v.video_path} (ref: {v.reference_patch})")
+    else:
+        # Legacy approach: build from command-line args
+        if not args.train_videos or not args.train_labels or not args.val_videos or not args.val_labels:
+            parser.error("Either --data_config or all of --train_videos, --train_labels, --val_videos, --val_labels must be provided")
+
+        if len(args.train_videos) != len(args.train_labels):
+            parser.error("Number of train videos must match number of train labels")
+        if len(args.val_videos) != len(args.val_labels):
+            parser.error("Number of val videos must match number of val labels")
+
+        print("Using legacy mode (single reference patch for all videos)")
+        data_config = create_data_config_from_lists(
+            train_videos=args.train_videos,
+            train_labels=args.train_labels,
+            train_ref_patches=[tuple(args.reference_patch)] * len(args.train_videos),
+            val_videos=args.val_videos,
+            val_labels=args.val_labels,
+            val_ref_patches=[tuple(args.reference_patch)] * len(args.val_videos)
+        )
+
+    # Create data loaders
+    combined_config = {**config['training'], **config['model'], **config['data']}
+    train_loader, val_loader = create_data_loaders_from_config(
+        data_config=data_config,
+        behavior_list=behavior_list,
+        dinov3_extractor=dinov3_extractor,
+        config=combined_config,
+        cache_dir=args.output_dir + '/cache' if args.output_dir else None
+    )
+
+    print(f"Train windows: {len(train_loader.dataset)}")
+    print(f"Val windows: {len(val_loader.dataset)}")
+
     # Loss and optimizer
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.AdamW(
@@ -344,22 +397,6 @@ def main():
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', factor=0.5, patience=5, verbose=True
     )
-
-    # Create data loaders
-    train_loader, val_loader = create_data_loaders(
-        train_videos=args.train_videos,
-        train_labels=args.train_labels,
-        val_videos=args.val_videos,
-        val_labels=args.val_labels,
-        behavior_list=behavior_list,
-        dinov3_extractor=dinov3_extractor,
-        reference_patch_coords=tuple(args.reference_patch),
-        config={**config['training'], **config['model'], **config['data']},
-        cache_dir=args.output_dir + '/cache' if args.output_dir else None
-    )
-
-    print(f"Train windows: {len(train_loader.dataset)}")
-    print(f"Val windows: {len(val_loader.dataset)}")
 
     # Resume from checkpoint if specified
     start_epoch = 0

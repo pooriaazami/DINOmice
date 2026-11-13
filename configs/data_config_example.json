@@ -1,0 +1,33 @@
+{
+  "train": [
+    {
+      "video_path": "data/video1.mp4",
+      "label_path": "data/labels1.json",
+      "reference_patch": [7, 7]
+    },
+    {
+      "video_path": "data/video2.mp4",
+      "label_path": "data/labels2.json",
+      "reference_patch": [8, 6]
+    },
+    {
+      "video_path": "data/video3.mp4",
+      "label_path": "data/labels3.json",
+      "reference_patch": [6, 8]
+    }
+  ],
+  "val": [
+    {
+      "video_path": "data/val_video.mp4",
+      "label_path": "data/val_labels.json",
+      "reference_patch": [7, 7]
+    }
+  ],
+  "test": [
+    {
+      "video_path": "data/test_video.mp4",
+      "label_path": "data/test_labels.json",
+      "reference_patch": [7, 7]
+    }
+  ]
+}

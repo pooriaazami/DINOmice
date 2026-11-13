@@ -2,16 +2,20 @@
 """
 Test/Evaluation script for DINOv3-based Behavior Classification.
 
-Usage:
+Usage (new JSON config approach):
+    python scripts/test.py \
+        --checkpoint outputs/experiment/checkpoint_best.pth \
+        --config configs/behaviors.yaml \
+        --data_config configs/data_config.json \
+        --output_dir outputs/test_results
+
+Usage (legacy approach - single reference patch for all videos):
     python scripts/test.py \
         --checkpoint outputs/experiment/checkpoint_best.pth \
         --config configs/behaviors.yaml \
         --test_videos data/test_video1.mp4 data/test_video2.mp4 \
         --test_labels data/test_labels1.json data/test_labels2.json \
         --reference_patch 7 7 \
-        --window_size 16 \
-        --similarity_threshold 0.8 \
-        --border_size 1 \
         --output_dir outputs/test_results
 """
 
@@ -42,7 +46,8 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from models.behavior_classifier import BehaviorClassifier, create_model_from_config
 from utils.dinov3_extractor import DINOv3Extractor
-from utils.dataset import BehaviorDataset, create_data_loaders
+from utils.dataset import BehaviorDataset
+from utils.data_config import load_data_config, create_data_config_from_lists
 from torch.utils.data import DataLoader
 
 
@@ -55,15 +60,19 @@ def parse_args():
     parser.add_argument('--config', type=str, default='configs/behaviors.yaml',
                         help='Path to config YAML file')
 
-    # Test data
-    parser.add_argument('--test_videos', nargs='+', required=True,
-                        help='Paths to test videos')
-    parser.add_argument('--test_labels', nargs='+', required=True,
-                        help='Paths to test label files')
+    # Data (new JSON config approach)
+    parser.add_argument('--data_config', type=str, default=None,
+                        help='Path to JSON data config file with train/val/test splits and per-video reference patches')
+
+    # Data (legacy approach - for backward compatibility)
+    parser.add_argument('--test_videos', nargs='+', default=None,
+                        help='Paths to test videos (legacy)')
+    parser.add_argument('--test_labels', nargs='+', default=None,
+                        help='Paths to test label files (legacy)')
 
     # Model parameters (must match training)
     parser.add_argument('--reference_patch', nargs=2, type=int, default=[7, 7],
-                        help='Reference patch coordinates (row col)')
+                        help='Reference patch coordinates (row col) - used for all videos in legacy mode')
     parser.add_argument('--window_size', type=int, default=None,
                         help='Temporal window size (frames)')
     parser.add_argument('--similarity_threshold', type=float, default=None,
@@ -72,8 +81,8 @@ def parse_args():
                         help='Border size around selected patches')
     parser.add_argument('--max_patches_per_frame', type=int, default=50,
                         help='Maximum patches per frame after padding')
-    parser.add_argument('--frame_sample_rate', type=int, default=1,
-                        help='Sample every N frames')
+    parser.add_argument('--frame_sample_rate', type=int, default=None,
+                        help='Sample every N frames (overrides config)')
     parser.add_argument('--stride', type=int, default=1,
                         help='Stride between windows')
 
@@ -326,6 +335,7 @@ def save_results(
     for i, meta in enumerate(metadata):
         row = {
             'video_idx': meta['video_idx'],
+            'video_path': meta.get('video_path', ''),
             'window_start_frame': meta['window_start_frame'],
             'last_frame_idx': meta['last_frame_idx'],
         }
@@ -387,19 +397,45 @@ def main():
     # Load model
     model = load_model(args.checkpoint, config, num_behaviors, device)
 
+    # Load data config
+    if args.data_config:
+        # New approach: load from JSON file
+        print(f"Loading data config from: {args.data_config}")
+        data_config = load_data_config(args.data_config)
+        test_configs = data_config.test if data_config.test else data_config.val
+        print(f"  Test videos: {len(test_configs)}")
+        for v in test_configs:
+            print(f"    Test: {v.video_path} (ref: {v.reference_patch})")
+    else:
+        # Legacy approach: build from command-line args
+        if not args.test_videos or not args.test_labels:
+            parser.error("Either --data_config or both --test_videos and --test_labels must be provided")
+
+        if len(args.test_videos) != len(args.test_labels):
+            parser.error("Number of test videos must match number of test labels")
+
+        print("Using legacy mode (single reference patch for all videos)")
+        data_config = create_data_config_from_lists(
+            train_videos=[], train_labels=[], train_ref_patches=[],
+            val_videos=[], val_labels=[], val_ref_patches=[],
+            test_videos=args.test_videos,
+            test_labels=args.test_labels,
+            test_ref_patches=[tuple(args.reference_patch)] * len(args.test_videos)
+        )
+        test_configs = data_config.test
+
     # Create test dataset
+    combined_config = {**config['training'], **config['model'], **config['data']}
     test_dataset = BehaviorDataset(
-        video_paths=args.test_videos,
-        label_paths=args.test_labels,
+        video_configs=test_configs,
         behavior_list=behavior_list,
         dinov3_extractor=dinov3_extractor,
-        reference_patch_coords=tuple(args.reference_patch),
         window_size=config['model'].get('window_size', 16),
         stride=args.stride,
         similarity_threshold=config['model'].get('patch_similarity_threshold', 0.80),
         border_size=config['model'].get('border_size', 1),
         max_patches_per_frame=args.max_patches_per_frame,
-        frame_sample_rate=args.frame_sample_rate,
+        frame_sample_rate=config['data'].get('frame_sample_rate', 100),
         mode='test'
     )
 
@@ -438,14 +474,13 @@ def main():
     test_config = {
         'checkpoint': args.checkpoint,
         'config': args.config,
-        'test_videos': args.test_videos,
-        'test_labels': args.test_labels,
+        'data_config': args.data_config,
         'reference_patch': args.reference_patch,
         'window_size': config['model'].get('window_size', 16),
         'similarity_threshold': config['model'].get('patch_similarity_threshold', 0.80),
         'border_size': config['model'].get('border_size', 1),
         'threshold': args.threshold,
-        'frame_sample_rate': args.frame_sample_rate,
+        'frame_sample_rate': config['data'].get('frame_sample_rate', 100),
         'stride': args.stride
     }
     with open(output_dir / 'test_config.yaml', 'w') as f:

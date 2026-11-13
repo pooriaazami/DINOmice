@@ -1,6 +1,7 @@
 """
 Data loading utilities for behavior classification.
 Supports multi-video training with video-level validation split.
+Per-video reference patch configuration.
 """
 
 import os
@@ -20,37 +21,36 @@ from utils.dinov3_extractor import (
     create_sliding_windows
 )
 
+from utils.data_config import VideoConfig, DataConfig
+
 
 class BehaviorDataset(Dataset):
     """
     Dataset for behavior classification.
     Handles multiple videos with video-level train/val split.
+    Each video can have its own reference patch coordinates.
     """
 
     def __init__(
         self,
-        video_paths: List[str],
-        label_paths: List[str],
+        video_configs: List[VideoConfig],
         behavior_list: List[str],
         dinov3_extractor: DINOv3Extractor,
-        reference_patch_coords: Tuple[int, int],
         window_size: int = 16,
         stride: int = 1,
         similarity_threshold: float = 0.80,
         border_size: int = 1,
         max_patches_per_frame: int = 50,
-        frame_sample_rate: int = 1,
+        frame_sample_rate: int = 100,
         cache_dir: Optional[str] = None,
         mode: str = 'train'  # 'train', 'val', 'test'
     ):
-        self.video_paths = video_paths
-        self.label_paths = label_paths
+        self.video_configs = video_configs
         self.behavior_list = behavior_list
         self.num_behaviors = len(behavior_list)
         self.behavior_to_idx = {b: i for i, b in enumerate(behavior_list)}
 
         self.dinov3_extractor = dinov3_extractor
-        self.reference_patch_coords = reference_patch_coords
         self.window_size = window_size
         self.stride = stride
         self.similarity_threshold = similarity_threshold
@@ -69,8 +69,13 @@ class BehaviorDataset(Dataset):
 
     def _load_all_data(self):
         """Load and process all videos."""
-        for video_idx, (video_path, label_path) in enumerate(zip(self.video_paths, self.label_paths)):
-            print(f"Processing video {video_idx + 1}/{len(self.video_paths)}: {video_path}")
+        for video_idx, video_config in enumerate(self.video_configs):
+            video_path = video_config.video_path
+            label_path = video_config.label_path
+            ref_patch = video_config.reference_patch
+
+            print(f"Processing video {video_idx + 1}/{len(self.video_configs)}: {video_path}")
+            print(f"  Reference patch: {ref_patch}")
 
             # Load labels
             labels = self._load_labels(label_path)
@@ -85,8 +90,8 @@ class BehaviorDataset(Dataset):
                 print(f"  Warning: No frames extracted from {video_path}")
                 continue
 
-            # Get reference patch from first frame
-            ref_row, ref_col = self.reference_patch_coords
+            # Get reference patch from first frame using video-specific coords
+            ref_row, ref_col = ref_patch
             H_p, W_p = features.shape[1], features.shape[2]
 
             if ref_row >= H_p or ref_col >= W_p:
@@ -139,6 +144,7 @@ class BehaviorDataset(Dataset):
             for w in range(num_windows):
                 self.window_metadata.append({
                     'video_idx': video_idx,
+                    'video_path': video_path,
                     'window_start_frame': w * self.stride,
                     'last_frame_idx': frame_indices[w + self.window_size - 1]
                 })
@@ -160,7 +166,10 @@ class BehaviorDataset(Dataset):
             with open(label_path, 'r') as f:
                 data = json.load(f)
             # Expect format: {"frame_idx": ["behavior1", "behavior2"], ...}
-            labels = [[] for _ in range(max(data.keys()) + 1)]
+            if not data:
+                return [[]]
+            max_idx = max(int(k) for k in data.keys())
+            labels = [[] for _ in range(max_idx + 1)]
             for idx, behaviors in data.items():
                 labels[int(idx)] = behaviors
             return labels
@@ -168,8 +177,10 @@ class BehaviorDataset(Dataset):
             import pandas as pd
             df = pd.read_csv(label_path)
             # Expect columns: frame_idx, behavior (one row per behavior per frame)
+            if df.empty:
+                return [[]]
             max_frame = df['frame_idx'].max()
-            labels = [[] for _ in range(max_frame + 1)]
+            labels = [[] for _ in range(int(max_frame) + 1)]
             for _, row in df.iterrows():
                 labels[int(row['frame_idx'])].append(row['behavior'])
             return labels
@@ -198,47 +209,39 @@ class BehaviorDataset(Dataset):
         }
 
 
-def create_data_loaders(
-    train_videos: List[str],
-    train_labels: List[str],
-    val_videos: List[str],
-    val_labels: List[str],
+def create_data_loaders_from_config(
+    data_config: DataConfig,
     behavior_list: List[str],
     dinov3_extractor: DINOv3Extractor,
-    reference_patch_coords: Tuple[int, int],
     config: Dict,
     cache_dir: Optional[str] = None
 ) -> Tuple[DataLoader, DataLoader]:
-    """Create train and validation data loaders."""
+    """Create train and validation data loaders from DataConfig."""
 
     train_dataset = BehaviorDataset(
-        video_paths=train_videos,
-        label_paths=train_labels,
+        video_configs=data_config.train,
         behavior_list=behavior_list,
         dinov3_extractor=dinov3_extractor,
-        reference_patch_coords=reference_patch_coords,
         window_size=config.get('window_size', 16),
         stride=config.get('stride', 1),
         similarity_threshold=config.get('similarity_threshold', 0.80),
         border_size=config.get('border_size', 1),
         max_patches_per_frame=config.get('max_patches_per_frame', 50),
-        frame_sample_rate=config.get('frame_sample_rate', 1),
+        frame_sample_rate=config.get('frame_sample_rate', 100),
         cache_dir=cache_dir,
         mode='train'
     )
 
     val_dataset = BehaviorDataset(
-        video_paths=val_videos,
-        label_paths=val_labels,
+        video_configs=data_config.val,
         behavior_list=behavior_list,
         dinov3_extractor=dinov3_extractor,
-        reference_patch_coords=reference_patch_coords,
         window_size=config.get('window_size', 16),
         stride=config.get('stride', 1),
         similarity_threshold=config.get('similarity_threshold', 0.80),
         border_size=config.get('border_size', 1),
         max_patches_per_frame=config.get('max_patches_per_frame', 50),
-        frame_sample_rate=config.get('frame_sample_rate', 1),
+        frame_sample_rate=config.get('frame_sample_rate', 100),
         cache_dir=cache_dir,
         mode='val'
     )
@@ -264,27 +267,53 @@ def create_data_loaders(
     return train_loader, val_loader
 
 
+# Backward compatibility function
+def create_data_loaders(
+    train_videos: List[str],
+    train_labels: List[str],
+    val_videos: List[str],
+    val_labels: List[str],
+    behavior_list: List[str],
+    dinov3_extractor: DINOv3Extractor,
+    reference_patch_coords: Tuple[int, int],
+    config: Dict,
+    cache_dir: Optional[str] = None
+) -> Tuple[DataLoader, DataLoader]:
+    """Create train and validation data loaders (legacy interface)."""
+    from utils.data_config import create_data_config_from_lists
+
+    # Create uniform reference patches for all videos
+    train_ref_patches = [reference_patch_coords] * len(train_videos)
+    val_ref_patches = [reference_patch_coords] * len(val_videos)
+
+    data_config = create_data_config_from_lists(
+        train_videos, train_labels, train_ref_patches,
+        val_videos, val_labels, val_ref_patches
+    )
+
+    return create_data_loaders_from_config(data_config, behavior_list, dinov3_extractor, config, cache_dir)
+
+
 class PredictionDataset(Dataset):
     """
     Dataset for prediction on unseen videos.
     Does not require labels.
+    Supports per-video reference patches.
     """
 
     def __init__(
         self,
-        video_paths: List[str],
+        video_configs: List[VideoConfig],
         dinov3_extractor: DINOv3Extractor,
-        reference_patch_coords: Tuple[int, int],
         window_size: int = 16,
         stride: int = 1,
         similarity_threshold: float = 0.80,
         border_size: int = 1,
         max_patches_per_frame: int = 50,
-        frame_sample_rate: int = 1
+        frame_sample_rate: int = 100
     ):
-        self.video_paths = video_paths
+        self.video_configs = video_configs
         self.dinov3_extractor = dinov3_extractor
-        self.reference_patch_coords = reference_patch_coords
         self.window_size = window_size
         self.stride = stride
         self.similarity_threshold = similarity_threshold
@@ -298,8 +327,12 @@ class PredictionDataset(Dataset):
         self._process_videos()
 
     def _process_videos(self):
-        for video_idx, video_path in enumerate(self.video_paths):
-            print(f"Processing video {video_idx + 1}/{len(self.video_paths)}: {video_path}")
+        for video_idx, video_config in enumerate(self.video_configs):
+            video_path = video_config.video_path
+            ref_patch = video_config.reference_patch
+
+            print(f"Processing video {video_idx + 1}/{len(self.video_configs)}: {video_path}")
+            print(f"  Reference patch: {ref_patch}")
 
             features, frame_indices = self.dinov3_extractor.extract_video_features(
                 video_path,
@@ -309,7 +342,7 @@ class PredictionDataset(Dataset):
             if features.shape[0] == 0:
                 continue
 
-            ref_row, ref_col = self.reference_patch_coords
+            ref_row, ref_col = ref_patch
             H_p, W_p = features.shape[1], features.shape[2]
 
             if ref_row >= H_p or ref_col >= W_p:
