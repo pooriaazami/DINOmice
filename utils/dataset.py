@@ -2,7 +2,7 @@
 Data loading utilities for behavior classification.
 Supports multi-video training with video-level validation split.
 Per-video reference patch configuration.
-Lazy loading with disk caching for long videos.
+Fully lazy loading with disk caching for long videos.
 """
 
 import os
@@ -42,12 +42,23 @@ def _get_windows_cache_key(video_path: str, sample_rate: int, dinov3_model: str,
     return hashlib.md5(key_str.encode()).hexdigest()
 
 
+def _get_video_info(video_path: str) -> Tuple[int, float]:
+    """Get video frame count and fps using OpenCV (fast, no GPU memory)."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    return total_frames, fps
+
+
 class BehaviorDataset(Dataset):
     """
-    Dataset for behavior classification with lazy loading.
+    Dataset for behavior classification with fully lazy loading.
     Handles multiple videos with video-level train/val split.
     Each video can have its own reference patch coordinates.
-    Features are cached to disk to avoid re-processing long videos.
+    Features are extracted on-demand per window and cached to disk.
     """
 
     def __init__(
@@ -82,16 +93,17 @@ class BehaviorDataset(Dataset):
         # Dinov3 model name for cache key
         self.dinov3_model = getattr(dinov3_extractor, 'model_name', 'facebook/dinov3-vitb16-pretrain-lvd1689m')
 
-        # Build window index mapping: global_idx -> (video_idx, local_window_idx)
-        self.window_index = []  # List of (video_idx, local_window_idx)
+        # Build window index mapping: global_idx -> (video_idx, local_window_idx, window_frame_indices)
+        self.window_index = []  # List of (video_idx, local_window_idx, window_start_frame_idx)
         self.video_window_counts = []  # Number of windows per video
         self.video_metadata = []  # Per-video metadata
         self.video_labels = []  # Per-video labels (list per frame)
+        self.video_ref_patch_embeddings = {}  # Cache for reference patch embeddings
 
         self._build_index()
 
     def _build_index(self):
-        """Build index of all windows across all videos without loading data."""
+        """Build index of all windows across all videos WITHOUT extracting features."""
         for video_idx, video_config in enumerate(self.video_configs):
             video_path = video_config.video_path
             label_path = video_config.label_path
@@ -104,101 +116,122 @@ class BehaviorDataset(Dataset):
             labels = self._load_labels(label_path)
             self.video_labels.append(labels)
 
-            # Check cache for pre-computed window count
-            cache_key = _get_windows_cache_key(
-                video_path, self.frame_sample_rate, self.dinov3_model,
-                ref_patch, self.similarity_threshold, self.border_size,
-                self.window_size, self.stride, self.max_patches_per_frame,
-                self.frame_sample_rate
-            )
+            # Get video info using OpenCV (fast, no GPU memory)
+            try:
+                total_frames, fps = _get_video_info(video_path)
+                print(f"  Video: {total_frames} frames, {fps:.1f} FPS")
+            except Exception as e:
+                print(f"  Warning: Could not read video info: {e}")
+                self.video_window_counts.append(0)
+                self.video_metadata.append(None)
+                continue
 
-            num_windows = 0
-            frame_indices = None
+            # Calculate frame indices that would be sampled
+            frame_indices = list(range(0, total_frames, self.frame_sample_rate))
+            num_sampled_frames = len(frame_indices)
 
-            if self.cache_dir:
-                cache_file = self.cache_dir / f"{cache_key}_windows.pt"
-                if cache_file.exists():
-                    try:
-                        cached = torch.load(cache_file, map_location='cpu', weights_only=False)
-                        num_windows = cached['num_windows']
-                        frame_indices = cached['frame_indices']
-                        print(f"  Using cached windows: {num_windows}")
-                    except Exception as e:
-                        print(f"  Cache read failed, will recompute: {e}")
+            if num_sampled_frames < self.window_size:
+                print(f"  Warning: Not enough frames ({num_sampled_frames}) for window size ({self.window_size})")
+                self.video_window_counts.append(0)
+                self.video_metadata.append(None)
+                continue
 
-            if num_windows == 0:
-                # Need to compute window count - extract features once to get frame count
-                features, frame_indices = self.dinov3_extractor.extract_video_features(
-                    video_path,
-                    sample_rate=self.frame_sample_rate
-                )
+            # Calculate number of sliding windows
+            num_windows = (num_sampled_frames - self.window_size) // self.stride + 1
+            if num_windows <= 0:
+                num_windows = 0
 
-                if features.shape[0] == 0:
-                    print(f"  Warning: No frames extracted from {video_path}")
-                    self.video_window_counts.append(0)
-                    self.video_metadata.append(None)
-                    continue
-
-                # Get reference patch from first frame
-                ref_row, ref_col = ref_patch
-                H_p, W_p = features.shape[1], features.shape[2]
-
-                if ref_row >= H_p or ref_col >= W_p:
-                    ref_row = H_p // 2
-                    ref_col = W_p // 2
-                    print(f"  Warning: Reference patch out of bounds, using center ({ref_row}, {ref_col})")
-
-                # Select similar patches to get patch counts per frame
-                selected_embeddings, _ = select_similar_patches(
-                    features,
-                    features[0, ref_row, ref_col],
-                    threshold=self.similarity_threshold,
-                    border=self.border_size
-                )
-
-                # Pad to get max patches per frame
-                padded_embeddings, patch_mask = pad_patch_sequence(
-                    selected_embeddings,
-                    max_patches=self.max_patches_per_frame
-                )
-
-                # Create sliding windows to get count
-                windows, _ = create_sliding_windows(
-                    padded_embeddings,
-                    patch_mask,
-                    window_size=self.window_size,
-                    stride=self.stride
-                )
-
-                num_windows = windows.shape[0]
-
-                # Cache the frame indices for label alignment
-                if self.cache_dir:
-                    self.cache_dir.mkdir(parents=True, exist_ok=True)
-                    cache_file = self.cache_dir / f"{cache_key}_windows.pt"
-                    torch.save({
-                        'num_windows': num_windows,
-                        'frame_indices': frame_indices,
-                        'ref_patch_used': (ref_row, ref_col)
-                    }, cache_file)
+            print(f"  Sampled frames: {num_sampled_frames}, Estimated windows: {num_windows}")
 
             self.video_window_counts.append(num_windows)
 
-            # Build global index
+            # Build global index - store frame indices for each window
             for w in range(num_windows):
-                self.window_index.append((video_idx, w))
+                window_start_sampled_idx = w * self.stride
+                window_frame_indices = frame_indices[window_start_sampled_idx:window_start_sampled_idx + self.window_size]
+                self.window_index.append((video_idx, w, window_frame_indices))
 
             # Store metadata for this video
             self.video_metadata.append({
                 'video_path': video_path,
                 'ref_patch': ref_patch,
                 'frame_indices': frame_indices,
-                'num_frames': len(frame_indices) if frame_indices is not None else 0,
+                'total_frames': total_frames,
+                'fps': fps,
+                'num_sampled_frames': num_sampled_frames,
                 'num_windows': num_windows
             })
 
         total_windows = len(self.window_index)
         print(f"Total windows across all videos: {total_windows}")
+
+        # Pre-extract reference patches for all videos (only first frame)
+        self._precompute_reference_patches()
+
+    def _precompute_reference_patches(self):
+        """Extract reference patch embedding from first frame of each video."""
+        for video_idx, video_config in enumerate(self.video_configs):
+            metadata = self.video_metadata[video_idx]
+            if metadata is None or metadata['num_windows'] == 0:
+                self.video_ref_patch_embeddings[video_idx] = None
+                continue
+
+            video_path = video_config.video_path
+            ref_patch = video_config.reference_patch
+
+            cache_key = _get_video_cache_key(video_path, self.frame_sample_rate, self.dinov3_model)
+
+            # Check cache for reference patch
+            if self.cache_dir:
+                cache_file = self.cache_dir / f"{cache_key}_ref_patch.pt"
+                if cache_file.exists():
+                    try:
+                        cached = torch.load(cache_file, map_location='cpu', weights_only=False)
+                        self.video_ref_patch_embeddings[video_idx] = cached['ref_patch_embedding']
+                        print(f"  Video {video_idx}: Using cached reference patch")
+                        continue
+                    except Exception as e:
+                        print(f"  Reference patch cache read failed: {e}")
+
+            # Extract first frame only
+            cap = cv2.VideoCapture(video_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = cap.read()
+            cap.release()
+
+            if not ret:
+                print(f"  Warning: Could not read first frame of {video_path}")
+                self.video_ref_patch_embeddings[video_idx] = None
+                continue
+
+            # Process first frame (BGR->RGB->Grayscale->3-channel as in notebook)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            frame = np.repeat(frame[..., None], 3, axis=-1)
+
+            # Extract features
+            features = self.dinov3_extractor.extract_frame_features(frame)  # H_p x W_p x D
+
+            # Get reference patch
+            ref_row, ref_col = ref_patch
+            H_p, W_p = features.shape[0], features.shape[1]
+            if ref_row >= H_p or ref_col >= W_p:
+                ref_row = H_p // 2
+                ref_col = W_p // 2
+                print(f"  Warning: Reference patch out of bounds, using center ({ref_row}, {ref_col})")
+
+            ref_embedding = features[ref_row, ref_col]  # D
+
+            self.video_ref_patch_embeddings[video_idx] = ref_embedding
+
+            # Cache reference patch
+            if self.cache_dir:
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+                cache_file = self.cache_dir / f"{cache_key}_ref_patch.pt"
+                try:
+                    torch.save({'ref_patch_embedding': ref_embedding, 'ref_patch_used': (ref_row, ref_col)}, cache_file)
+                except Exception as e:
+                    print(f"  Failed to cache reference patch: {e}")
 
     def _load_labels(self, label_path: str) -> List[List[str]]:
         """Load frame-wise labels from file."""
@@ -235,62 +268,64 @@ class BehaviorDataset(Dataset):
                 labels.append(behaviors)
             return labels
 
-    def _process_video_windows(self, video_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _extract_window_features(self, video_idx: int, window_frame_indices: List[int]) -> torch.Tensor:
         """
-        Process a single video to generate all its windows.
-        Returns (windows_tensor, window_labels_tensor)
+        Extract features for a specific window's frames only.
+        Returns: (window_size, max_patches_per_frame, D)
         """
         video_config = self.video_configs[video_idx]
         video_path = video_config.video_path
-        label_path = video_config.label_path
         ref_patch = video_config.reference_patch
-        labels = self.video_labels[video_idx]
-        metadata = self.video_metadata[video_idx]
+        ref_embedding = self.video_ref_patch_embeddings[video_idx]
 
-        if metadata is None or metadata['num_windows'] == 0:
-            return torch.empty(0, self.window_size, self.max_patches_per_frame, 768), \
-                   torch.empty(0, self.num_behaviors)
+        if ref_embedding is None:
+            return torch.zeros(self.window_size, self.max_patches_per_frame, 768)
 
-        cache_key = _get_windows_cache_key(
-            video_path, self.frame_sample_rate, self.dinov3_model,
-            ref_patch, self.similarity_threshold, self.border_size,
-            self.window_size, self.stride, self.max_patches_per_frame,
-            self.frame_sample_rate
-        )
+        cache_key = _get_video_cache_key(video_path, self.frame_sample_rate, self.dinov3_model)
+        cache_key = f"{cache_key}_frames_{hashlib.md5(str(window_frame_indices).encode()).hexdigest()[:8]}"
 
-        # Try to load fully processed windows from cache
+        # Check cache for this specific window
         if self.cache_dir:
-            cache_file = self.cache_dir / f"{cache_key}_full.pt"
+            cache_file = self.cache_dir / f"{cache_key}_window.pt"
             if cache_file.exists():
                 try:
                     cached = torch.load(cache_file, map_location='cpu', weights_only=False)
-                    return cached['windows'], cached['window_labels']
+                    return cached['window_features']
                 except Exception as e:
-                    print(f"  Full cache read failed: {e}")
+                    pass  # Fall through to extraction
 
-        # Extract features
-        features, frame_indices = self.dinov3_extractor.extract_video_features(
-            video_path,
-            sample_rate=self.frame_sample_rate
-        )
+        # Extract features for only the frames in this window
+        cap = cv2.VideoCapture(video_path)
+        features_list = []
 
-        if features.shape[0] == 0:
-            return torch.empty(0, self.window_size, self.max_patches_per_frame, 768), \
-                   torch.empty(0, self.num_behaviors)
+        for frame_idx in window_frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                # If frame read fails, use zeros
+                features_list.append(torch.zeros(14, 14, 768))
+                continue
 
-        # Get reference patch
-        ref_row, ref_col = ref_patch
-        H_p, W_p = features.shape[1], features.shape[2]
-        if ref_row >= H_p or ref_col >= W_p:
-            ref_row = H_p // 2
-            ref_col = W_p // 2
+            # Process frame (BGR->RGB->Grayscale->3-channel as in notebook)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            frame = np.repeat(frame[..., None], 3, axis=-1)
 
-        reference_patch = features[0, ref_row, ref_col]
+            features = self.dinov3_extractor.extract_frame_features(frame)  # H_p x W_p x D
+            features_list.append(features)
 
-        # Select similar patches
-        selected_embeddings, selected_coords = select_similar_patches(
+        cap.release()
+
+        if not features_list:
+            return torch.zeros(self.window_size, self.max_patches_per_frame, 768)
+
+        # Stack features: (window_size, H_p, W_p, D)
+        features = torch.stack(features_list)
+
+        # Select similar patches for all frames in window
+        selected_embeddings, _ = select_similar_patches(
             features,
-            reference_patch,
+            ref_embedding,
             threshold=self.similarity_threshold,
             border=self.border_size
         )
@@ -301,51 +336,25 @@ class BehaviorDataset(Dataset):
             max_patches=self.max_patches_per_frame
         )
 
-        # Create sliding windows
-        windows, window_masks = create_sliding_windows(
-            padded_embeddings,
-            patch_mask,
-            window_size=self.window_size,
-            stride=self.stride
-        )
-
-        # Create labels for each window (label of the last frame in window)
-        num_windows = windows.shape[0]
-        window_labels = torch.zeros(num_windows, self.num_behaviors, dtype=torch.float32)
-
-        for w in range(num_windows):
-            last_frame_idx = frame_indices[w + self.window_size - 1]
-            if last_frame_idx < len(labels):
-                frame_labels = labels[last_frame_idx]
-                for behavior in frame_labels:
-                    if behavior in self.behavior_to_idx:
-                        window_labels[w, self.behavior_to_idx[behavior]] = 1.0
-
-        # Cache fully processed windows
+        # Cache this window's features
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-            cache_file = self.cache_dir / f"{cache_key}_full.pt"
+            cache_file = self.cache_dir / f"{cache_key}_window.pt"
             try:
-                torch.save({
-                    'windows': windows,
-                    'window_labels': window_labels
-                }, cache_file)
+                torch.save({'window_features': padded_embeddings}, cache_file)
             except Exception as e:
-                print(f"  Failed to cache full windows: {e}")
+                pass
 
-        return windows, window_labels
+        return padded_embeddings
 
     def __len__(self):
         return len(self.window_index)
 
     def __getitem__(self, idx):
-        video_idx, local_window_idx = self.window_index[idx]
+        video_idx, local_window_idx, window_frame_indices = self.window_index[idx]
 
-        # Process video windows on demand (or load from cache)
-        windows, window_labels = self._process_video_windows(video_idx)
-
-        if windows.shape[0] == 0:
-            # Return empty tensor with correct shape
+        metadata = self.video_metadata[video_idx]
+        if metadata is None or metadata['num_windows'] == 0:
             return {
                 'patch_embeddings': torch.zeros(self.window_size, self.max_patches_per_frame, 768),
                 'labels': torch.zeros(self.num_behaviors, dtype=torch.float32),
@@ -357,15 +366,20 @@ class BehaviorDataset(Dataset):
                 }
             }
 
-        window = windows[local_window_idx]
-        label = window_labels[local_window_idx]
+        # Extract features for this window only
+        window_features = self._extract_window_features(video_idx, window_frame_indices)
 
-        # Get frame indices for metadata
-        metadata_info = self.video_metadata[video_idx]
-        frame_indices = metadata_info['frame_indices']
-        last_frame_idx = frame_indices[local_window_idx + self.window_size - 1] if local_window_idx + self.window_size - 1 < len(frame_indices) else -1
+        # Get label for the last frame in the window
+        last_frame_idx = window_frame_indices[-1]
+        labels = self.video_labels[video_idx]
+        window_labels = torch.zeros(self.num_behaviors, dtype=torch.float32)
+        if last_frame_idx < len(labels):
+            frame_labels = labels[last_frame_idx]
+            for behavior in frame_labels:
+                if behavior in self.behavior_to_idx:
+                    window_labels[self.behavior_to_idx[behavior]] = 1.0
 
-        metadata = {
+        meta = {
             'video_idx': video_idx,
             'video_path': self.video_configs[video_idx].video_path,
             'window_start_frame': local_window_idx * self.stride,
@@ -373,15 +387,15 @@ class BehaviorDataset(Dataset):
         }
 
         return {
-            'patch_embeddings': window,
-            'labels': label,
-            'metadata': metadata
+            'patch_embeddings': window_features,
+            'labels': window_labels,
+            'metadata': meta
         }
 
 
 class PredictionDataset(Dataset):
     """
-    Dataset for prediction on unseen videos with lazy loading.
+    Dataset for prediction on unseen videos with fully lazy loading.
     Does not require labels.
     Supports per-video reference patches.
     """
@@ -413,11 +427,13 @@ class PredictionDataset(Dataset):
         self.window_index = []
         self.video_window_counts = []
         self.video_metadata = []
+        self.video_ref_patch_embeddings = {}
 
         self._build_index()
+        self._precompute_reference_patches()
 
     def _build_index(self):
-        """Build index of all windows without loading data."""
+        """Build index of all windows without extracting features."""
         for video_idx, video_config in enumerate(self.video_configs):
             video_path = video_config.video_path
             ref_patch = video_config.reference_patch
@@ -425,136 +441,155 @@ class PredictionDataset(Dataset):
             print(f"Indexing video {video_idx + 1}/{len(self.video_configs)}: {video_path}")
             print(f"  Reference patch: {ref_patch}")
 
-            cache_key = _get_windows_cache_key(
-                video_path, self.frame_sample_rate, self.dinov3_model,
-                ref_patch, self.similarity_threshold, self.border_size,
-                self.window_size, self.stride, self.max_patches_per_frame,
-                self.frame_sample_rate
-            )
+            try:
+                total_frames, fps = _get_video_info(video_path)
+                print(f"  Video: {total_frames} frames, {fps:.1f} FPS")
+            except Exception as e:
+                print(f"  Warning: Could not read video info: {e}")
+                self.video_window_counts.append(0)
+                self.video_metadata.append(None)
+                continue
 
-            num_windows = 0
-            frame_indices = None
+            frame_indices = list(range(0, total_frames, self.frame_sample_rate))
+            num_sampled_frames = len(frame_indices)
 
-            if self.cache_dir:
-                cache_file = self.cache_dir / f"{cache_key}_windows.pt"
-                if cache_file.exists():
-                    try:
-                        cached = torch.load(cache_file, map_location='cpu', weights_only=False)
-                        num_windows = cached['num_windows']
-                        frame_indices = cached['frame_indices']
-                        print(f"  Using cached windows: {num_windows}")
-                    except Exception as e:
-                        print(f"  Cache read failed: {e}")
+            if num_sampled_frames < self.window_size:
+                print(f"  Warning: Not enough frames ({num_sampled_frames}) for window size ({self.window_size})")
+                self.video_window_counts.append(0)
+                self.video_metadata.append(None)
+                continue
 
-            if num_windows == 0:
-                features, frame_indices = self.dinov3_extractor.extract_video_features(
-                    video_path,
-                    sample_rate=self.frame_sample_rate
-                )
+            num_windows = (num_sampled_frames - self.window_size) // self.stride + 1
+            if num_windows <= 0:
+                num_windows = 0
 
-                if features.shape[0] == 0:
-                    print(f"  Warning: No frames extracted from {video_path}")
-                    self.video_window_counts.append(0)
-                    self.video_metadata.append(None)
-                    continue
-
-                ref_row, ref_col = ref_patch
-                H_p, W_p = features.shape[1], features.shape[2]
-                if ref_row >= H_p or ref_col >= W_p:
-                    ref_row = H_p // 2
-                    ref_col = W_p // 2
-
-                selected_embeddings, _ = select_similar_patches(
-                    features,
-                    features[0, ref_row, ref_col],
-                    threshold=self.similarity_threshold,
-                    border=self.border_size
-                )
-
-                padded_embeddings, patch_mask = pad_patch_sequence(
-                    selected_embeddings,
-                    max_patches=self.max_patches_per_frame
-                )
-
-                windows, _ = create_sliding_windows(
-                    padded_embeddings,
-                    patch_mask,
-                    window_size=self.window_size,
-                    stride=self.stride
-                )
-
-                num_windows = windows.shape[0]
-
-                if self.cache_dir:
-                    self.cache_dir.mkdir(parents=True, exist_ok=True)
-                    cache_file = self.cache_dir / f"{cache_key}_windows.pt"
-                    torch.save({
-                        'num_windows': num_windows,
-                        'frame_indices': frame_indices,
-                        'ref_patch_used': (ref_row, ref_col)
-                    }, cache_file)
+            print(f"  Sampled frames: {num_sampled_frames}, Estimated windows: {num_windows}")
 
             self.video_window_counts.append(num_windows)
 
             for w in range(num_windows):
-                self.window_index.append((video_idx, w))
+                window_start_sampled_idx = w * self.stride
+                window_frame_indices = frame_indices[window_start_sampled_idx:window_start_sampled_idx + self.window_size]
+                self.window_index.append((video_idx, w, window_frame_indices))
 
             self.video_metadata.append({
                 'video_path': video_path,
                 'ref_patch': ref_patch,
                 'frame_indices': frame_indices,
-                'num_frames': len(frame_indices) if frame_indices is not None else 0,
+                'total_frames': total_frames,
+                'fps': fps,
+                'num_sampled_frames': num_sampled_frames,
                 'num_windows': num_windows
             })
 
         total_windows = len(self.window_index)
         print(f"Total prediction windows: {total_windows}")
 
-    def _process_video_windows(self, video_idx: int) -> torch.Tensor:
-        """Process a single video to generate all its windows."""
+    def _precompute_reference_patches(self):
+        """Extract reference patch embedding from first frame of each video."""
+        for video_idx, video_config in enumerate(self.video_configs):
+            metadata = self.video_metadata[video_idx]
+            if metadata is None or metadata['num_windows'] == 0:
+                self.video_ref_patch_embeddings[video_idx] = None
+                continue
+
+            video_path = video_config.video_path
+            ref_patch = video_config.reference_patch
+
+            cache_key = _get_video_cache_key(video_path, self.frame_sample_rate, self.dinov3_model)
+
+            if self.cache_dir:
+                cache_file = self.cache_dir / f"{cache_key}_ref_patch.pt"
+                if cache_file.exists():
+                    try:
+                        cached = torch.load(cache_file, map_location='cpu', weights_only=False)
+                        self.video_ref_patch_embeddings[video_idx] = cached['ref_patch_embedding']
+                        print(f"  Video {video_idx}: Using cached reference patch")
+                        continue
+                    except Exception as e:
+                        print(f"  Reference patch cache read failed: {e}")
+
+            cap = cv2.VideoCapture(video_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = cap.read()
+            cap.release()
+
+            if not ret:
+                print(f"  Warning: Could not read first frame of {video_path}")
+                self.video_ref_patch_embeddings[video_idx] = None
+                continue
+
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            frame = np.repeat(frame[..., None], 3, axis=-1)
+
+            features = self.dinov3_extractor.extract_frame_features(frame)
+            ref_row, ref_col = ref_patch
+            H_p, W_p = features.shape[0], features.shape[1]
+            if ref_row >= H_p or ref_col >= W_p:
+                ref_row = H_p // 2
+                ref_col = W_p // 2
+
+            ref_embedding = features[ref_row, ref_col]
+            self.video_ref_patch_embeddings[video_idx] = ref_embedding
+
+            if self.cache_dir:
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+                cache_file = self.cache_dir / f"{cache_key}_ref_patch.pt"
+                try:
+                    torch.save({'ref_patch_embedding': ref_embedding, 'ref_patch_used': (ref_row, ref_col)}, cache_file)
+                except Exception as e:
+                    print(f"  Failed to cache reference patch: {e}")
+
+    def _extract_window_features(self, video_idx: int, window_frame_indices: List[int]) -> torch.Tensor:
+        """Extract features for a specific window's frames only."""
         video_config = self.video_configs[video_idx]
         video_path = video_config.video_path
         ref_patch = video_config.reference_patch
-        metadata = self.video_metadata[video_idx]
+        ref_embedding = self.video_ref_patch_embeddings[video_idx]
 
-        if metadata is None or metadata['num_windows'] == 0:
-            return torch.empty(0, self.window_size, self.max_patches_per_frame, 768)
+        if ref_embedding is None:
+            return torch.zeros(self.window_size, self.max_patches_per_frame, 768)
 
-        cache_key = _get_windows_cache_key(
-            video_path, self.frame_sample_rate, self.dinov3_model,
-            ref_patch, self.similarity_threshold, self.border_size,
-            self.window_size, self.stride, self.max_patches_per_frame,
-            self.frame_sample_rate
-        )
+        cache_key = _get_video_cache_key(video_path, self.frame_sample_rate, self.dinov3_model)
+        cache_key = f"{cache_key}_frames_{hashlib.md5(str(window_frame_indices).encode()).hexdigest()[:8]}"
 
         if self.cache_dir:
-            cache_file = self.cache_dir / f"{cache_key}_full.pt"
+            cache_file = self.cache_dir / f"{cache_key}_window.pt"
             if cache_file.exists():
                 try:
                     cached = torch.load(cache_file, map_location='cpu', weights_only=False)
-                    return cached['windows']
+                    return cached['window_features']
                 except Exception as e:
-                    print(f"  Full cache read failed: {e}")
+                    pass
 
-        features, frame_indices = self.dinov3_extractor.extract_video_features(
-            video_path,
-            sample_rate=self.frame_sample_rate
-        )
+        cap = cv2.VideoCapture(video_path)
+        features_list = []
 
-        if features.shape[0] == 0:
-            return torch.empty(0, self.window_size, self.max_patches_per_frame, 768)
+        for frame_idx in window_frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                features_list.append(torch.zeros(14, 14, 768))
+                continue
 
-        ref_row, ref_col = ref_patch
-        H_p, W_p = features.shape[1], features.shape[2]
-        if ref_row >= H_p or ref_col >= W_p:
-            ref_row = H_p // 2
-            ref_col = W_p // 2
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            frame = np.repeat(frame[..., None], 3, axis=-1)
 
-        reference_patch = features[0, ref_row, ref_col]
+            features = self.dinov3_extractor.extract_frame_features(frame)
+            features_list.append(features)
 
-        selected_embeddings, selected_coords = select_similar_patches(
+        cap.release()
+
+        if not features_list:
+            return torch.zeros(self.window_size, self.max_patches_per_frame, 768)
+
+        features = torch.stack(features_list)
+
+        selected_embeddings, _ = select_similar_patches(
             features,
-            reference_patch,
+            ref_embedding,
             threshold=self.similarity_threshold,
             border=self.border_size
         )
@@ -564,32 +599,24 @@ class PredictionDataset(Dataset):
             max_patches=self.max_patches_per_frame
         )
 
-        windows, window_masks = create_sliding_windows(
-            padded_embeddings,
-            patch_mask,
-            window_size=self.window_size,
-            stride=self.stride
-        )
-
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-            cache_file = self.cache_dir / f"{cache_key}_full.pt"
+            cache_file = self.cache_dir / f"{cache_key}_window.pt"
             try:
-                torch.save({'windows': windows}, cache_file)
+                torch.save({'window_features': padded_embeddings}, cache_file)
             except Exception as e:
-                print(f"  Failed to cache full windows: {e}")
+                pass
 
-        return windows
+        return padded_embeddings
 
     def __len__(self):
         return len(self.window_index)
 
     def __getitem__(self, idx):
-        video_idx, local_window_idx = self.window_index[idx]
+        video_idx, local_window_idx, window_frame_indices = self.window_index[idx]
 
-        windows = self._process_video_windows(video_idx)
-
-        if windows.shape[0] == 0:
+        metadata = self.video_metadata[video_idx]
+        if metadata is None or metadata['num_windows'] == 0:
             return {
                 'patch_embeddings': torch.zeros(self.window_size, self.max_patches_per_frame, 768),
                 'metadata': {
@@ -601,23 +628,21 @@ class PredictionDataset(Dataset):
                 }
             }
 
-        window = windows[local_window_idx]
+        window_features = self._extract_window_features(video_idx, window_frame_indices)
 
-        metadata_info = self.video_metadata[video_idx]
-        frame_indices = metadata_info['frame_indices']
-        last_frame_idx = frame_indices[local_window_idx + self.window_size - 1] if local_window_idx + self.window_size - 1 < len(frame_indices) else -1
+        last_frame_idx = window_frame_indices[-1]
 
-        metadata = {
+        meta = {
             'video_idx': video_idx,
             'video_path': self.video_configs[video_idx].video_path,
             'window_start_frame': local_window_idx * self.stride,
             'last_frame_idx': last_frame_idx,
-            'frame_indices': frame_indices[local_window_idx:local_window_idx + self.window_size] if local_window_idx + self.window_size <= len(frame_indices) else []
+            'frame_indices': window_frame_indices
         }
 
         return {
-            'patch_embeddings': window,
-            'metadata': metadata
+            'patch_embeddings': window_features,
+            'metadata': meta
         }
 
 
