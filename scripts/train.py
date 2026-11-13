@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""
+Training script for DINOv3-based Behavior Classification.
+
+Usage:
+    python scripts/train.py \
+        --config configs/behaviors.yaml \
+        --train_videos data/video1.mp4 data/video2.mp4 \
+        --train_labels data/labels1.json data/labels2.json \
+        --val_videos data/val_video.mp4 \
+        --val_labels data/val_labels.json \
+        --reference_patch 7 7 \
+        --window_size 16 \
+        --similarity_threshold 0.8 \
+        --border_size 1 \
+        --output_dir outputs/experiment1
+"""
+
+import argparse
+import os
+import sys
+import yaml
+import json
+import time
+from pathlib import Path
+from typing import List, Dict, Tuple
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+from sklearn.metrics import f1_score, classification_report
+import numpy as np
+from tqdm import tqdm
+
+# Add parent directory to path
+sys.path.append(str(Path(__file__).parent.parent))
+
+from models.behavior_classifier import BehaviorClassifier, create_model_from_config
+from utils.dinov3_extractor import DINOv3Extractor
+from utils.dataset import create_data_loaders, BehaviorDataset
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train DINOv3-based Behavior Classifier')
+
+    # Config
+    parser.add_argument('--config', type=str, default='configs/behaviors.yaml',
+                        help='Path to config YAML file')
+
+    # Data
+    parser.add_argument('--train_videos', nargs='+', required=True,
+                        help='Paths to training videos')
+    parser.add_argument('--train_labels', nargs='+', required=True,
+                        help='Paths to training label files')
+    parser.add_argument('--val_videos', nargs='+', required=True,
+                        help='Paths to validation videos')
+    parser.add_argument('--val_labels', nargs='+', required=True,
+                        help='Paths to validation label files')
+
+    # Model parameters (override config)
+    parser.add_argument('--reference_patch', nargs=2, type=int, default=[7, 7],
+                        help='Reference patch coordinates (row col)')
+    parser.add_argument('--window_size', type=int, default=None,
+                        help='Temporal window size (frames)')
+    parser.add_argument('--similarity_threshold', type=float, default=None,
+                        help='Similarity threshold for patch selection')
+    parser.add_argument('--border_size', type=int, default=None,
+                        help='Border size around selected patches')
+    parser.add_argument('--max_patches_per_frame', type=int, default=50,
+                        help='Maximum patches per frame after padding')
+    parser.add_argument('--frame_sample_rate', type=int, default=1,
+                        help='Sample every N frames')
+
+    # Training parameters
+    parser.add_argument('--batch_size', type=int, default=None,
+                        help='Batch size')
+    parser.add_argument('--learning_rate', type=float, default=None,
+                        help='Learning rate')
+    parser.add_argument('--num_epochs', type=int, default=None,
+                        help='Number of epochs')
+    parser.add_argument('--weight_decay', type=float, default=None,
+                        help='Weight decay')
+    parser.add_argument('--gradient_clip', type=float, default=None,
+                        help='Gradient clipping value')
+    parser.add_argument('--early_stopping_patience', type=int, default=None,
+                        help='Early stopping patience')
+    parser.add_argument('--num_workers', type=int, default=None,
+                        help='Number of data loader workers')
+
+    # Output
+    parser.add_argument('--output_dir', type=str, default='outputs/experiment',
+                        help='Output directory for checkpoints and logs')
+    parser.add_argument('--experiment_name', type=str, default=None,
+                        help='Experiment name for TensorBoard')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Device (cuda/cpu)')
+
+    # DINOv3
+    parser.add_argument('--dinov3_model', type=str, default=None,
+                        help='DINOv3 model name')
+
+    return parser.parse_args()
+
+
+def load_config(config_path: str) -> Dict:
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
+
+
+def merge_config(args, config: Dict) -> Dict:
+    """Merge command-line arguments with config file."""
+    # Model config
+    model_config = config.get('model', {})
+    if args.window_size is not None:
+        model_config['window_size'] = args.window_size
+    if args.similarity_threshold is not None:
+        model_config['patch_similarity_threshold'] = args.similarity_threshold
+    if args.border_size is not None:
+        model_config['border_size'] = args.border_size
+    if args.dinov3_model is not None:
+        model_config['dinov3_model'] = args.dinov3_model
+
+    # Training config
+    train_config = config.get('training', {})
+    if args.batch_size is not None:
+        train_config['batch_size'] = args.batch_size
+    if args.learning_rate is not None:
+        train_config['learning_rate'] = args.learning_rate
+    if args.num_epochs is not None:
+        train_config['num_epochs'] = args.num_epochs
+    if args.weight_decay is not None:
+        train_config['weight_decay'] = args.weight_decay
+    if args.gradient_clip is not None:
+        train_config['gradient_clip'] = args.gradient_clip
+    if args.early_stopping_patience is not None:
+        train_config['early_stopping_patience'] = args.early_stopping_patience
+    if args.num_workers is not None:
+        train_config['num_workers'] = args.num_workers
+
+    # Data config
+    data_config = config.get('data', {})
+    if args.frame_sample_rate is not None:
+        data_config['frame_sample_rate'] = args.frame_sample_rate
+
+    return {
+        'model': model_config,
+        'training': train_config,
+        'data': data_config,
+        'behaviors': config.get('behaviors', [])
+    }
+
+
+def compute_metrics(predictions: np.ndarray, targets: np.ndarray, threshold: float = 0.5) -> Dict:
+    """Compute multi-label classification metrics."""
+    preds_binary = (predictions > threshold).astype(int)
+
+    # Macro F1
+    macro_f1 = f1_score(targets, preds_binary, average='macro', zero_division=0)
+
+    # Per-class F1
+    per_class_f1 = f1_score(targets, preds_binary, average=None, zero_division=0)
+
+    # Subset accuracy (exact match)
+    subset_acc = np.mean(np.all(preds_binary == targets, axis=1))
+
+    # Hamming loss
+    hamming_loss = np.mean(preds_binary != targets)
+
+    return {
+        'macro_f1': macro_f1,
+        'per_class_f1': per_class_f1,
+        'subset_accuracy': subset_acc,
+        'hamming_loss': hamming_loss
+    }
+
+
+def train_epoch(
+    model: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+    gradient_clip: float = 1.0,
+    epoch: int = 0
+) -> Tuple[float, Dict]:
+    """Train for one epoch."""
+    model.train()
+    total_loss = 0.0
+    all_preds = []
+    all_targets = []
+
+    pbar = tqdm(loader, desc=f'Epoch {epoch} [Train]')
+    for batch in pbar:
+        patch_embeddings = batch['patch_embeddings'].to(device)  # (B, W, P, D)
+        labels = batch['labels'].to(device)  # (B, num_behaviors)
+
+        optimizer.zero_grad()
+
+        logits = model(patch_embeddings)
+        loss = criterion(logits, labels)
+
+        loss.backward()
+
+        if gradient_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+
+        optimizer.step()
+
+        total_loss += loss.item()
+
+        # Store predictions
+        preds = torch.sigmoid(logits).detach().cpu().numpy()
+        all_preds.append(preds)
+        all_targets.append(labels.detach().cpu().numpy())
+
+        pbar.set_postfix({'loss': loss.item()})
+
+    avg_loss = total_loss / len(loader)
+    all_preds = np.vstack(all_preds)
+    all_targets = np.vstack(all_targets)
+
+    metrics = compute_metrics(all_preds, all_targets)
+    metrics['loss'] = avg_loss
+
+    return avg_loss, metrics
+
+
+def validate(
+    model: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    epoch: int = 0
+) -> Tuple[float, Dict]:
+    """Validate model."""
+    model.eval()
+    total_loss = 0.0
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        pbar = tqdm(loader, desc=f'Epoch {epoch} [Val]')
+        for batch in pbar:
+            patch_embeddings = batch['patch_embeddings'].to(device)
+            labels = batch['labels'].to(device)
+
+            logits = model(patch_embeddings)
+            loss = criterion(logits, labels)
+
+            total_loss += loss.item()
+
+            preds = torch.sigmoid(logits).cpu().numpy()
+            all_preds.append(preds)
+            all_targets.append(labels.cpu().numpy())
+
+            pbar.set_postfix({'loss': loss.item()})
+
+    avg_loss = total_loss / len(loader)
+    all_preds = np.vstack(all_preds)
+    all_targets = np.vstack(all_targets)
+
+    metrics = compute_metrics(all_preds, all_targets)
+    metrics['loss'] = avg_loss
+
+    return avg_loss, metrics
+
+
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    epoch: int,
+    best_metric: float,
+    config: Dict,
+    output_dir: Path,
+    is_best: bool = False
+):
+    """Save model checkpoint."""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'best_metric': best_metric,
+        'config': config
+    }
+
+    # Save latest
+    torch.save(checkpoint, output_dir / 'checkpoint_latest.pth')
+
+    # Save best
+    if is_best:
+        torch.save(checkpoint, output_dir / 'checkpoint_best.pth')
+        print(f"  Saved best model (macro_f1: {best_metric:.4f})")
+
+
+def main():
+    args = parse_args()
+
+    # Load and merge config
+    config = load_config(args.config)
+    config = merge_config(args, config)
+
+    # Setup output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save merged config
+    with open(output_dir / 'config.yaml', 'w') as f:
+        yaml.dump(config, f)
+
+    # Setup TensorBoard
+    experiment_name = args.experiment_name or output_dir.name
+    writer = SummaryWriter(log_dir=output_dir / 'tensorboard' / experiment_name)
+
+    # Device
+    device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
+    print(f"Using device: {device}")
+
+    # Load behavior list
+    behavior_list = config['behaviors']
+    num_behaviors = len(behavior_list)
+    print(f"Behaviors ({num_behaviors}): {behavior_list}")
+
+    # Initialize DINOv3 extractor
+    dinov3_model = config['model'].get('dinov3_model', 'facebook/dinov3-vitb16-pretrain-lvd1689m')
+    dinov3_extractor = DINOv3Extractor(model_name=dinov3_model, device=str(device))
+
+    # Create model
+    model = create_model_from_config(args.config, num_behaviors).to(device)
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # Loss and optimizer
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=config['training'].get('learning_rate', 1e-4),
+        weight_decay=config['training'].get('weight_decay', 1e-5)
+    )
+
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=5, verbose=True
+    )
+
+    # Create data loaders
+    train_loader, val_loader = create_data_loaders(
+        train_videos=args.train_videos,
+        train_labels=args.train_labels,
+        val_videos=args.val_videos,
+        val_labels=args.val_labels,
+        behavior_list=behavior_list,
+        dinov3_extractor=dinov3_extractor,
+        reference_patch_coords=tuple(args.reference_patch),
+        config={**config['training'], **config['model'], **config['data']},
+        cache_dir=args.output_dir + '/cache' if args.output_dir else None
+    )
+
+    print(f"Train windows: {len(train_loader.dataset)}")
+    print(f"Val windows: {len(val_loader.dataset)}")
+
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    best_macro_f1 = 0.0
+
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_macro_f1 = checkpoint.get('best_metric', 0.0)
+        print(f"Resumed from epoch {start_epoch}, best macro_f1: {best_macro_f1:.4f}")
+
+    # Training loop
+    num_epochs = config['training'].get('num_epochs', 50)
+    early_stopping_patience = config['training'].get('early_stopping_patience', 10)
+    gradient_clip = config['training'].get('gradient_clip', 1.0)
+
+    patience_counter = 0
+
+    print(f"\nStarting training for {num_epochs} epochs...")
+
+    for epoch in range(start_epoch, num_epochs):
+        epoch_start = time.time()
+
+        # Train
+        train_loss, train_metrics = train_epoch(
+            model, train_loader, criterion, optimizer, device,
+            gradient_clip=gradient_clip, epoch=epoch
+        )
+
+        # Validate
+        val_loss, val_metrics = validate(
+            model, val_loader, criterion, device, epoch=epoch
+        )
+
+        epoch_time = time.time() - epoch_start
+
+        # Log metrics
+        writer.add_scalar('Loss/train', train_loss, epoch)
+        writer.add_scalar('Loss/val', val_loss, epoch)
+        writer.add_scalar('MacroF1/train', train_metrics['macro_f1'], epoch)
+        writer.add_scalar('MacroF1/val', val_metrics['macro_f1'], epoch)
+        writer.add_scalar('SubsetAcc/train', train_metrics['subset_accuracy'], epoch)
+        writer.add_scalar('SubsetAcc/val', val_metrics['subset_accuracy'], epoch)
+        writer.add_scalar('LearningRate', optimizer.param_groups[0]['lr'], epoch)
+
+        # Per-class F1
+        for i, (behavior, f1) in enumerate(zip(behavior_list, val_metrics['per_class_f1'])):
+            writer.add_scalar(f'PerClassF1/val/{behavior}', f1, epoch)
+
+        # Print progress
+        print(f"Epoch {epoch:3d} | "
+              f"Train: Loss={train_loss:.4f} MacroF1={train_metrics['macro_f1']:.4f} SubsetAcc={train_metrics['subset_accuracy']:.4f} | "
+              f"Val: Loss={val_loss:.4f} MacroF1={val_metrics['macro_f1']:.4f} SubsetAcc={val_metrics['subset_accuracy']:.4f} | "
+              f"Time={epoch_time:.1f}s")
+
+        # Learning rate scheduling
+        scheduler.step(val_metrics['macro_f1'])
+
+        # Check for improvement
+        is_best = val_metrics['macro_f1'] > best_macro_f1
+        if is_best:
+            best_macro_f1 = val_metrics['macro_f1']
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        # Save checkpoint
+        save_checkpoint(
+            model, optimizer, epoch, best_macro_f1, config, output_dir, is_best
+        )
+
+        # Early stopping
+        if patience_counter >= early_stopping_patience:
+            print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+            break
+
+    writer.close()
+    print(f"\nTraining complete! Best validation macro_f1: {best_macro_f1:.4f}")
+    print(f"Checkpoints saved to: {output_dir}")
+
+
+if __name__ == '__main__':
+    main()
