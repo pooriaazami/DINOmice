@@ -387,10 +387,13 @@ def main():
 
     # Loss and optimizer
     criterion = nn.BCEWithLogitsLoss()
+    # Ensure numeric config values are floats (YAML may parse as strings if quoted)
+    lr = float(config['training'].get('learning_rate', 1e-4))
+    weight_decay = float(config['training'].get('weight_decay', 1e-5))
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=config['training'].get('learning_rate', 1e-4),
-        weight_decay=config['training'].get('weight_decay', 1e-5)
+        lr=lr,
+        weight_decay=weight_decay
     )
 
     # Learning rate scheduler
@@ -411,9 +414,9 @@ def main():
         print(f"Resumed from epoch {start_epoch}, best macro_f1: {best_macro_f1:.4f}")
 
     # Training loop
-    num_epochs = config['training'].get('num_epochs', 50)
-    early_stopping_patience = config['training'].get('early_stopping_patience', 10)
-    gradient_clip = config['training'].get('gradient_clip', 1.0)
+    num_epochs = int(config['training'].get('num_epochs', 50))
+    early_stopping_patience = int(config['training'].get('early_stopping_patience', 10))
+    gradient_clip = float(config['training'].get('gradient_clip', 1.0))
 
     patience_counter = 0
 
