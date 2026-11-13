@@ -6,16 +6,16 @@ Usage (new JSON config approach):
     python scripts/predict.py \
         --checkpoint outputs/experiment/checkpoint_best.pth \
         --config configs/behaviors.yaml \
-        --data_config configs/data_config.json \
-        --output_dir outputs/predictions
+        --data-config configs/data_config.json \
+        --output-dir outputs/predictions
 
 Usage (legacy approach - single reference patch for all videos):
     python scripts/predict.py \
         --checkpoint outputs/experiment/checkpoint_best.pth \
         --config configs/behaviors.yaml \
         --videos data/test_video1.mp4 data/test_video2.mp4 \
-        --reference_patch 7 7 \
-        --output_dir outputs/predictions
+        --reference-patch 7 7 \
+        --output-dir outputs/predictions
 """
 
 import argparse
@@ -53,7 +53,7 @@ def parse_args():
                         help='Path to config YAML file')
 
     # Data (new JSON config approach)
-    parser.add_argument('--data_config', type=str, default=None,
+    parser.add_argument('--data-config', dest='data_config', type=str, default=None,
                         help='Path to JSON data config file with train/val/test splits and per-video reference patches')
 
     # Data (legacy approach - for backward compatibility)
@@ -61,31 +61,31 @@ def parse_args():
                         help='Paths to videos for prediction (legacy)')
 
     # Model parameters (must match training)
-    parser.add_argument('--reference_patch', nargs=2, type=int, default=[7, 7],
+    parser.add_argument('--reference-patch', dest='reference_patch', nargs=2, type=int, default=[7, 7],
                         help='Reference patch coordinates (row col) - used for all videos in legacy mode')
-    parser.add_argument('--window_size', type=int, default=None,
+    parser.add_argument('--window-size', dest='window_size', type=int, default=None,
                         help='Temporal window size (frames)')
-    parser.add_argument('--similarity_threshold', type=float, default=None,
+    parser.add_argument('--similarity-threshold', dest='similarity_threshold', type=float, default=None,
                         help='Similarity threshold for patch selection')
-    parser.add_argument('--border_size', type=int, default=None,
+    parser.add_argument('--border-size', dest='border_size', type=int, default=None,
                         help='Border size around selected patches')
-    parser.add_argument('--max_patches_per_frame', type=int, default=50,
+    parser.add_argument('--max-patches-per-frame', dest='max_patches_per_frame', type=int, default=50,
                         help='Maximum patches per frame after padding')
-    parser.add_argument('--frame_sample_rate', type=int, default=None,
+    parser.add_argument('--frame-sample-rate', dest='frame_sample_rate', type=int, default=None,
                         help='Sample every N frames (overrides config)')
     parser.add_argument('--stride', type=int, default=1,
                         help='Stride between windows')
 
     # Output
-    parser.add_argument('--output_dir', type=str, default='outputs/predictions',
+    parser.add_argument('--output-dir', dest='output_dir', type=str, default='outputs/predictions',
                         help='Output directory for predictions')
     parser.add_argument('--threshold', type=float, default=0.5,
                         help='Classification threshold for multi-label')
-    parser.add_argument('--save_probs', action='store_true',
+    parser.add_argument('--save-probs', dest='save_probs', action='store_true',
                         help='Save raw probabilities in addition to binary predictions')
-    parser.add_argument('--batch_size', type=int, default=8,
+    parser.add_argument('--batch-size', dest='batch_size', type=int, default=8,
                         help='Batch size for prediction')
-    parser.add_argument('--num_workers', type=int, default=4,
+    parser.add_argument('--num-workers', dest='num_workers', type=int, default=4,
                         help='Number of data loader workers')
     parser.add_argument('--device', type=str, default=None,
                         help='Device (cuda/cpu)')
@@ -292,7 +292,7 @@ def main():
     else:
         # Legacy approach: build from command-line args
         if not args.videos:
-            parser.error("Either --data_config or --videos must be provided")
+            parser.error("Either --data-config or --videos must be provided")
 
         print("Using legacy mode (single reference patch for all videos)")
         data_config = create_data_config_from_lists(

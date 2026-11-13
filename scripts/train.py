@@ -5,18 +5,18 @@ Training script for DINOv3-based Behavior Classification.
 Usage (new JSON config approach):
     python scripts/train.py \
         --config configs/behaviors.yaml \
-        --data_config configs/data_config.json \
-        --output_dir outputs/experiment1
+        --data-config configs/data_config.json \
+        --output-dir outputs/experiment1
 
 Usage (legacy approach - single reference patch for all videos):
     python scripts/train.py \
         --config configs/behaviors.yaml \
-        --train_videos data/video1.mp4 data/video2.mp4 \
-        --train_labels data/labels1.json data/labels2.json \
-        --val_videos data/val_video.mp4 \
-        --val_labels data/val_labels.json \
-        --reference_patch 7 7 \
-        --output_dir outputs/experiment1
+        --train-videos data/video1.mp4 data/video2.mp4 \
+        --train-labels data/labels1.json data/labels2.json \
+        --val-videos data/val_video.mp4 \
+        --val-labels data/val_labels.json \
+        --reference-patch 7 7 \
+        --output-dir outputs/experiment1
 """
 
 import argparse
@@ -53,53 +53,53 @@ def parse_args():
                         help='Path to config YAML file')
 
     # Data (new JSON config approach)
-    parser.add_argument('--data_config', type=str, default=None,
+    parser.add_argument('--data-config', dest='data_config', type=str, default=None,
                         help='Path to JSON data config file with train/val/test splits and per-video reference patches')
 
     # Data (legacy approach - for backward compatibility)
-    parser.add_argument('--train_videos', nargs='+', default=None,
+    parser.add_argument('--train-videos', dest='train_videos', nargs='+', default=None,
                         help='Paths to training videos (legacy)')
-    parser.add_argument('--train_labels', nargs='+', default=None,
+    parser.add_argument('--train-labels', dest='train_labels', nargs='+', default=None,
                         help='Paths to training label files (legacy)')
-    parser.add_argument('--val_videos', nargs='+', default=None,
+    parser.add_argument('--val-videos', dest='val_videos', nargs='+', default=None,
                         help='Paths to validation videos (legacy)')
-    parser.add_argument('--val_labels', nargs='+', default=None,
+    parser.add_argument('--val-labels', dest='val_labels', nargs='+', default=None,
                         help='Paths to validation label files (legacy)')
 
     # Model parameters (override config)
-    parser.add_argument('--reference_patch', nargs=2, type=int, default=[7, 7],
+    parser.add_argument('--reference-patch', dest='reference_patch', nargs=2, type=int, default=[7, 7],
                         help='Reference patch coordinates (row col) - used for all videos in legacy mode')
-    parser.add_argument('--window_size', type=int, default=None,
+    parser.add_argument('--window-size', dest='window_size', type=int, default=None,
                         help='Temporal window size (frames)')
-    parser.add_argument('--similarity_threshold', type=float, default=None,
+    parser.add_argument('--similarity-threshold', dest='similarity_threshold', type=float, default=None,
                         help='Similarity threshold for patch selection')
-    parser.add_argument('--border_size', type=int, default=None,
+    parser.add_argument('--border-size', dest='border_size', type=int, default=None,
                         help='Border size around selected patches')
-    parser.add_argument('--max_patches_per_frame', type=int, default=50,
+    parser.add_argument('--max-patches-per-frame', dest='max_patches_per_frame', type=int, default=50,
                         help='Maximum patches per frame after padding')
-    parser.add_argument('--frame_sample_rate', type=int, default=None,
+    parser.add_argument('--frame-sample-rate', dest='frame_sample_rate', type=int, default=None,
                         help='Sample every N frames (overrides config)')
 
     # Training parameters
-    parser.add_argument('--batch_size', type=int, default=None,
+    parser.add_argument('--batch-size', dest='batch_size', type=int, default=None,
                         help='Batch size')
-    parser.add_argument('--learning_rate', type=float, default=None,
+    parser.add_argument('--learning-rate', dest='learning_rate', type=float, default=None,
                         help='Learning rate')
-    parser.add_argument('--num_epochs', type=int, default=None,
+    parser.add_argument('--num-epochs', dest='num_epochs', type=int, default=None,
                         help='Number of epochs')
-    parser.add_argument('--weight_decay', type=float, default=None,
+    parser.add_argument('--weight-decay', dest='weight_decay', type=float, default=None,
                         help='Weight decay')
-    parser.add_argument('--gradient_clip', type=float, default=None,
+    parser.add_argument('--gradient-clip', dest='gradient_clip', type=float, default=None,
                         help='Gradient clipping value')
-    parser.add_argument('--early_stopping_patience', type=int, default=None,
+    parser.add_argument('--early-stopping-patience', dest='early_stopping_patience', type=int, default=None,
                         help='Early stopping patience')
-    parser.add_argument('--num_workers', type=int, default=None,
+    parser.add_argument('--num-workers', dest='num_workers', type=int, default=None,
                         help='Number of data loader workers')
 
     # Output
-    parser.add_argument('--output_dir', type=str, default='outputs/experiment',
+    parser.add_argument('--output-dir', dest='output_dir', type=str, default='outputs/experiment',
                         help='Output directory for checkpoints and logs')
-    parser.add_argument('--experiment_name', type=str, default=None,
+    parser.add_argument('--experiment-name', dest='experiment_name', type=str, default=None,
                         help='Experiment name for TensorBoard')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
@@ -107,7 +107,7 @@ def parse_args():
                         help='Device (cuda/cpu)')
 
     # DINOv3
-    parser.add_argument('--dinov3_model', type=str, default=None,
+    parser.add_argument('--dinov3-model', dest='dinov3_model', type=str, default=None,
                         help='DINOv3 model name')
 
     return parser.parse_args()
@@ -176,13 +176,13 @@ def compute_metrics(predictions: np.ndarray, targets: np.ndarray, threshold: flo
     subset_acc = np.mean(np.all(preds_binary == targets, axis=1))
 
     # Hamming loss
-    hamming_loss = np.mean(preds_binary != targets)
+    hamming_loss_val = np.mean(preds_binary != targets)
 
     return {
         'macro_f1': macro_f1,
         'per_class_f1': per_class_f1,
         'subset_accuracy': subset_acc,
-        'hamming_loss': hamming_loss
+        'hamming_loss': hamming_loss_val
     }
 
 
@@ -355,7 +355,7 @@ def main():
     else:
         # Legacy approach: build from command-line args
         if not args.train_videos or not args.train_labels or not args.val_videos or not args.val_labels:
-            parser.error("Either --data_config or all of --train_videos, --train_labels, --val_videos, --val_labels must be provided")
+            parser.error("Either --data-config or all of --train-videos, --train-labels, --val-videos, --val-labels must be provided")
 
         if len(args.train_videos) != len(args.train_labels):
             parser.error("Number of train videos must match number of train labels")

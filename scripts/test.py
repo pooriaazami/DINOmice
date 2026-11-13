@@ -6,17 +6,17 @@ Usage (new JSON config approach):
     python scripts/test.py \
         --checkpoint outputs/experiment/checkpoint_best.pth \
         --config configs/behaviors.yaml \
-        --data_config configs/data_config.json \
-        --output_dir outputs/test_results
+        --data-config configs/data_config.json \
+        --output-dir outputs/test_results
 
 Usage (legacy approach - single reference patch for all videos):
     python scripts/test.py \
         --checkpoint outputs/experiment/checkpoint_best.pth \
         --config configs/behaviors.yaml \
-        --test_videos data/test_video1.mp4 data/test_video2.mp4 \
-        --test_labels data/test_labels1.json data/test_labels2.json \
-        --reference_patch 7 7 \
-        --output_dir outputs/test_results
+        --test-videos data/test_video1.mp4 data/test_video2.mp4 \
+        --test-labels data/test_labels1.json data/test_labels2.json \
+        --reference-patch 7 7 \
+        --output-dir outputs/test_results
 """
 
 import argparse
@@ -61,27 +61,27 @@ def parse_args():
                         help='Path to config YAML file')
 
     # Data (new JSON config approach)
-    parser.add_argument('--data_config', type=str, default=None,
+    parser.add_argument('--data-config', dest='data_config', type=str, default=None,
                         help='Path to JSON data config file with train/val/test splits and per-video reference patches')
 
     # Data (legacy approach - for backward compatibility)
-    parser.add_argument('--test_videos', nargs='+', default=None,
+    parser.add_argument('--test-videos', dest='test_videos', nargs='+', default=None,
                         help='Paths to test videos (legacy)')
-    parser.add_argument('--test_labels', nargs='+', default=None,
+    parser.add_argument('--test-labels', dest='test_labels', nargs='+', default=None,
                         help='Paths to test label files (legacy)')
 
     # Model parameters (must match training)
-    parser.add_argument('--reference_patch', nargs=2, type=int, default=[7, 7],
+    parser.add_argument('--reference-patch', dest='reference_patch', nargs=2, type=int, default=[7, 7],
                         help='Reference patch coordinates (row col) - used for all videos in legacy mode')
-    parser.add_argument('--window_size', type=int, default=None,
+    parser.add_argument('--window-size', dest='window_size', type=int, default=None,
                         help='Temporal window size (frames)')
-    parser.add_argument('--similarity_threshold', type=float, default=None,
+    parser.add_argument('--similarity-threshold', dest='similarity_threshold', type=float, default=None,
                         help='Similarity threshold for patch selection')
-    parser.add_argument('--border_size', type=int, default=None,
+    parser.add_argument('--border-size', dest='border_size', type=int, default=None,
                         help='Border size around selected patches')
-    parser.add_argument('--max_patches_per_frame', type=int, default=50,
+    parser.add_argument('--max-patches-per-frame', dest='max_patches_per_frame', type=int, default=50,
                         help='Maximum patches per frame after padding')
-    parser.add_argument('--frame_sample_rate', type=int, default=None,
+    parser.add_argument('--frame-sample-rate', dest='frame_sample_rate', type=int, default=None,
                         help='Sample every N frames (overrides config)')
     parser.add_argument('--stride', type=int, default=1,
                         help='Stride between windows')
@@ -89,17 +89,17 @@ def parse_args():
     # Evaluation parameters
     parser.add_argument('--threshold', type=float, default=0.5,
                         help='Classification threshold for multi-label')
-    parser.add_argument('--batch_size', type=int, default=8,
+    parser.add_argument('--batch-size', dest='batch_size', type=int, default=8,
                         help='Batch size for evaluation')
-    parser.add_argument('--num_workers', type=int, default=4,
+    parser.add_argument('--num-workers', dest='num_workers', type=int, default=4,
                         help='Number of data loader workers')
     parser.add_argument('--device', type=str, default=None,
                         help='Device (cuda/cpu)')
 
     # Output
-    parser.add_argument('--output_dir', type=str, default='outputs/test_results',
+    parser.add_argument('--output-dir', dest='output_dir', type=str, default='outputs/test_results',
                         help='Output directory for test results')
-    parser.add_argument('--plot_cm', action='store_true',
+    parser.add_argument('--plot-cm', dest='plot_cm', action='store_true',
                         help='Plot confusion matrices')
 
     return parser.parse_args()
@@ -409,7 +409,7 @@ def main():
     else:
         # Legacy approach: build from command-line args
         if not args.test_videos or not args.test_labels:
-            parser.error("Either --data_config or both --test_videos and --test_labels must be provided")
+            parser.error("Either --data-config or both --test-videos and --test-labels must be provided")
 
         if len(args.test_videos) != len(args.test_labels):
             parser.error("Number of test videos must match number of test labels")
