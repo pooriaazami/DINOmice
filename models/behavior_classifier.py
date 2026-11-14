@@ -202,11 +202,13 @@ class BehaviorClassifier(nn.Module):
     def forward(
         self,
         patch_embeddings: torch.Tensor,
+        cls_tokens: Optional[torch.Tensor] = None,  # Ignored for GRU, for API compatibility
         patch_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Args:
             patch_embeddings: (batch, window_size, num_patches, dinov3_dim)
+            cls_tokens: (batch, window_size, dinov3_dim) - DINOv3 CLS tokens (ignored for GRU)
             patch_mask: (batch, window_size, num_patches) - boolean mask for valid patches
         Returns:
             logits: (batch, num_behaviors)
@@ -313,8 +315,12 @@ class BehaviorTransformer(nn.Module):
         self.use_cls_token = use_cls_token
         self.pool_type = pool_type
 
-        # Max sequence length = window_size * max_patches_per_frame + 1 (for CLS token)
-        self.max_seq_len = window_size * max_patches_per_frame + (1 if use_cls_token else 0)
+        # Max sequence length:
+        # - Base: window_size * max_patches_per_frame
+        # - Per-frame CLS tokens: + window_size (one per frame)
+        # - Learnable CLS token: + 1 (if use_cls_token)
+        # Maximum possible: window_size * (max_patches_per_frame + 1) + (1 if use_cls_token else 0)
+        self.max_seq_len = window_size * (max_patches_per_frame + 1) + (1 if use_cls_token else 0)
 
         # Input projection from DINOv3 dim to transformer dim
         self.input_proj = nn.Linear(dinov3_dim, transformer_dim)
@@ -363,34 +369,52 @@ class BehaviorTransformer(nn.Module):
     def forward(
         self,
         patch_embeddings: torch.Tensor,
+        cls_tokens: Optional[torch.Tensor] = None,
         patch_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Args:
             patch_embeddings: (batch, window_size, num_patches, dinov3_dim)
+            cls_tokens: (batch, window_size, dinov3_dim) - DINOv3 CLS token per frame
             patch_mask: (batch, window_size, num_patches) - boolean mask for valid patches (True = valid)
         Returns:
             logits: (batch, num_behaviors)
         """
         batch_size, window_size, num_patches, _ = patch_embeddings.shape
 
-        # Flatten window and patch dimensions: (batch, window_size * num_patches, dinov3_dim)
-        seq_len = window_size * num_patches
-        x = patch_embeddings.view(batch_size, seq_len, self.dinov3_dim)
+        # Per-frame concatenation: [Frame1_patches, Frame1_CLS], [Frame2_patches, Frame2_CLS], ...
+        # Result: (batch, window_size, num_patches + 1, dinov3_dim)
+        if cls_tokens is not None:
+            # Expand cls_tokens to (batch, window_size, 1, dinov3_dim) and concatenate
+            cls_tokens_expanded = cls_tokens.unsqueeze(2)  # (batch, window_size, 1, dinov3_dim)
+            x = torch.cat([patch_embeddings, cls_tokens_expanded], dim=2)  # (batch, window_size, num_patches+1, dinov3_dim)
+            num_patches_per_frame = num_patches + 1
+        else:
+            x = patch_embeddings
+            num_patches_per_frame = num_patches
+
+        # Flatten window and patch dimensions: (batch, window_size * num_patches_per_frame, dinov3_dim)
+        seq_len = window_size * num_patches_per_frame
+        x = x.view(batch_size, seq_len, self.dinov3_dim)
 
         # Project to transformer dimension
         x = self.input_proj(x)  # (batch, seq_len, transformer_dim)
 
         # Prepare mask: (batch, seq_len) - True for valid positions
-        if patch_mask is not None:
-            mask = patch_mask.view(batch_size, seq_len)  # (batch, seq_len)
+        if patch_mask is not None and cls_tokens is not None:
+            # Expand mask to include CLS token position (always valid)
+            cls_mask = torch.ones(batch_size, window_size, 1, dtype=torch.bool, device=patch_mask.device)
+            mask = torch.cat([patch_mask, cls_mask], dim=2)  # (batch, window_size, num_patches+1)
+            mask = mask.view(batch_size, seq_len)
+        elif patch_mask is not None:
+            mask = patch_mask.view(batch_size, seq_len)
         else:
             mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=x.device)
 
-        # Add CLS token
+        # Add CLS token (learnable) if enabled
         if self.use_cls_token:
-            cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # (batch, 1, transformer_dim)
-            x = torch.cat([cls_tokens, x], dim=1)  # (batch, seq_len + 1, transformer_dim)
+            cls_token_learnable = self.cls_token.expand(batch_size, -1, -1)  # (batch, 1, transformer_dim)
+            x = torch.cat([cls_token_learnable, x], dim=1)  # (batch, seq_len + 1, transformer_dim)
 
             # Extend mask for CLS token (always valid)
             cls_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=x.device)
@@ -408,12 +432,12 @@ class BehaviorTransformer(nn.Module):
 
         # Pool the output
         if self.pool_type == 'cls' and self.use_cls_token:
-            # Use CLS token output
+            # Use CLS token output (the learnable CLS token at position 0)
             pooled = x[:, 0]  # (batch, transformer_dim)
         elif self.pool_type == 'mean':
-            # Mean pooling over valid tokens (excluding CLS if present)
+            # Mean pooling over valid tokens (excluding learnable CLS if present)
             if self.use_cls_token:
-                token_embeddings = x[:, 1:]  # Exclude CLS
+                token_embeddings = x[:, 1:]  # Exclude learnable CLS
                 valid_mask = mask[:, 1:].unsqueeze(-1).float()  # (batch, seq_len, 1)
             else:
                 token_embeddings = x
@@ -481,7 +505,7 @@ if __name__ == "__main__":
     x = torch.randn(batch_size, window_size, num_patches, dinov3_dim)
     mask = torch.ones(batch_size, window_size, num_patches, dtype=torch.bool)
 
-    logits = model(x, mask)
+    logits = model(x, patch_mask=mask)
     print(f"GRU Output shape: {logits.shape}")
 
     # Test Transformer model
@@ -493,5 +517,11 @@ if __name__ == "__main__":
     )
     print(f"Transformer Model parameters: {sum(p.numel() for p in model_t.parameters()):,}")
 
-    logits_t = model_t(x, mask)
+    logits_t = model_t(x, patch_mask=mask)
     print(f"Transformer Output shape: {logits_t.shape}")
+
+    # Test Transformer with cls_tokens
+    print("\nTesting Transformer model with CLS tokens...")
+    cls_tokens = torch.randn(batch_size, window_size, dinov3_dim)
+    logits_t2 = model_t(x, cls_tokens=cls_tokens, patch_mask=mask)
+    print(f"Transformer Output shape (with CLS): {logits_t2.shape}")

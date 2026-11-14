@@ -291,10 +291,16 @@ def evaluate(
     with torch.no_grad():
         for batch in tqdm(loader, desc='Evaluating'):
             patch_embeddings = batch['patch_embeddings'].to(device)
+            cls_tokens = batch.get('cls_tokens')
+            if cls_tokens is not None:
+                cls_tokens = cls_tokens.to(device)
+            patch_mask = batch.get('patch_mask')
+            if patch_mask is not None:
+                patch_mask = patch_mask.to(device)
             labels = batch['labels'].to(device)
             metadata = batch['metadata']
 
-            logits = model(patch_embeddings)
+            logits = model(patch_embeddings, cls_tokens=cls_tokens, patch_mask=patch_mask)
             loss = criterion(logits, labels)
 
             total_loss += loss.item()

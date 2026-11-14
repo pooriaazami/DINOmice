@@ -279,7 +279,7 @@ class BehaviorDataset(Dataset):
 
         cache_key = _get_video_cache_key(video_path, self.frame_sample_rate, self.dinov3_model)
 
-        # Check cache for full video features
+        # Check cache for full video features (including CLS tokens)
         if self.cache_dir:
             cache_file = self.cache_dir / f"{cache_key}_features.pt"
             if cache_file.exists():
@@ -287,7 +287,7 @@ class BehaviorDataset(Dataset):
                     cached = torch.load(cache_file, map_location='cpu', weights_only=False)
                     # Verify the cached features match expected frame count
                     if cached['features'].shape[0] == metadata['num_sampled_frames']:
-                        return cached['features']
+                        return cached['features'], cached.get('cls_tokens', None)
                     else:
                         print(f"  Cached feature count mismatch, re-extracting...")
                 except Exception as e:
@@ -299,12 +299,14 @@ class BehaviorDataset(Dataset):
 
         cap = cv2.VideoCapture(video_path)
         features_list = []
+        cls_tokens_list = []
 
         for frame_idx in frame_indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             if not ret:
                 features_list.append(torch.zeros(14, 14, 768))
+                cls_tokens_list.append(torch.zeros(768))
                 continue
 
             # Process frame (BGR->RGB->Grayscale->3-channel as in notebook)
@@ -312,18 +314,20 @@ class BehaviorDataset(Dataset):
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
             frame = np.repeat(frame[..., None], 3, axis=-1)
 
-            features = self.dinov3_extractor.extract_frame_features(frame)  # H_p x W_p x D
+            features, cls_token = self.dinov3_extractor.extract_frame_features(frame, return_cls=True)
             features_list.append(features)
+            cls_tokens_list.append(cls_token)
 
         cap.release()
 
         if not features_list:
-            return torch.empty(0)
+            return torch.empty(0), torch.empty(0)
 
         # Stack features: (num_sampled_frames, H_p, W_p, D)
         features = torch.stack(features_list)
+        cls_tokens = torch.stack(cls_tokens_list)  # (num_sampled_frames, D)
 
-        # Cache full video features
+        # Cache full video features with CLS tokens
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             cache_file = self.cache_dir / f"{cache_key}_features.pt"
@@ -348,12 +352,14 @@ class BehaviorDataset(Dataset):
 
         if metadata is None or metadata['num_windows'] == 0:
             return torch.empty(0, self.window_size, self.max_patches_per_frame, 768), \
-                   torch.empty(0, self.num_behaviors)
+                   torch.empty(0, self.num_behaviors), \
+                   torch.empty(0, self.window_size, 768)
 
         ref_embedding = self.video_ref_patch_embeddings[video_idx]
         if ref_embedding is None:
             return torch.empty(0, self.window_size, self.max_patches_per_frame, 768), \
-                   torch.empty(0, self.num_behaviors)
+                   torch.empty(0, self.num_behaviors), \
+                   torch.empty(0, self.window_size, 768)
 
         cache_key = _get_processed_cache_key(
             video_path, self.frame_sample_rate, self.dinov3_model,
@@ -367,15 +373,21 @@ class BehaviorDataset(Dataset):
             if cache_file.exists():
                 try:
                     cached = torch.load(cache_file, map_location='cpu', weights_only=False)
-                    return cached['windows'], cached['window_labels']
+                    return (
+                        cached['windows'],
+                        cached['window_labels'],
+                        cached.get('window_cls_tokens', torch.empty(0, self.window_size, 768)),
+                        cached.get('window_masks', torch.empty(0, self.window_size, self.max_patches_per_frame, dtype=torch.bool))
+                    )
                 except Exception as e:
                     print(f"  Full cache read failed: {e}")
 
-        # Get cached video features
-        features = self._get_or_extract_video_features(video_idx)
+        # Get cached video features with CLS tokens
+        features, cls_tokens = self._get_or_extract_video_features(video_idx)
         if features.shape[0] == 0:
             return torch.empty(0, self.window_size, self.max_patches_per_frame, 768), \
-                   torch.empty(0, self.num_behaviors)
+                   torch.empty(0, self.num_behaviors), \
+                   torch.empty(0, self.window_size, 768)
 
         # Select similar patches for all frames
         selected_embeddings, _ = select_similar_patches(
@@ -399,8 +411,16 @@ class BehaviorDataset(Dataset):
             stride=self.stride
         )
 
-        # Create labels for each window (label of the last frame in window)
+        # Create CLS token windows (one CLS per frame in the window)
         num_windows = windows.shape[0]
+        window_cls_tokens = torch.zeros(num_windows, self.window_size, 768)
+        for w in range(num_windows):
+            for t in range(self.window_size):
+                frame_idx = w * self.stride + t
+                if frame_idx < cls_tokens.shape[0]:
+                    window_cls_tokens[w, t] = cls_tokens[frame_idx]
+
+        # Create labels for each window (label of the last frame in window)
         frame_indices = metadata['frame_indices']
         window_labels = torch.zeros(num_windows, self.num_behaviors, dtype=torch.float32)
 
@@ -412,19 +432,21 @@ class BehaviorDataset(Dataset):
                     if behavior in self.behavior_to_idx:
                         window_labels[w, self.behavior_to_idx[behavior]] = 1.0
 
-        # Cache fully processed windows
+        # Cache fully processed windows with CLS tokens and patch masks
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             cache_file = self.cache_dir / f"{cache_key}_full.pt"
             try:
                 torch.save({
                     'windows': windows,
-                    'window_labels': window_labels
+                    'window_labels': window_labels,
+                    'window_cls_tokens': window_cls_tokens,
+                    'window_masks': window_masks
                 }, cache_file)
             except Exception as e:
                 print(f"  Failed to cache full windows: {e}")
 
-        return windows, window_labels
+        return windows, window_labels, window_cls_tokens, window_masks
 
     def __len__(self):
         return len(self.window_index)
@@ -433,11 +455,13 @@ class BehaviorDataset(Dataset):
         video_idx, local_window_idx = self.window_index[idx]
 
         # Process video windows on demand (or load from cache)
-        windows, window_labels = self._process_video_windows(video_idx)
+        windows, window_labels, window_cls_tokens, window_masks = self._process_video_windows(video_idx)
 
         if windows.shape[0] == 0:
             return {
                 'patch_embeddings': torch.zeros(self.window_size, self.max_patches_per_frame, 768),
+                'cls_tokens': torch.zeros(self.window_size, 768),
+                'patch_mask': torch.zeros(self.window_size, self.max_patches_per_frame, dtype=torch.bool),
                 'labels': torch.zeros(self.num_behaviors, dtype=torch.float32),
                 'metadata': {
                     'video_idx': video_idx,
@@ -448,6 +472,8 @@ class BehaviorDataset(Dataset):
             }
 
         window = windows[local_window_idx]
+        cls_tokens = window_cls_tokens[local_window_idx]
+        patch_mask = window_masks[local_window_idx]
         label = window_labels[local_window_idx]
 
         # Get frame indices for metadata
@@ -464,6 +490,8 @@ class BehaviorDataset(Dataset):
 
         return {
             'patch_embeddings': window,
+            'cls_tokens': cls_tokens,
+            'patch_mask': patch_mask,
             'labels': label,
             'metadata': metadata
         }
@@ -614,14 +642,16 @@ class PredictionDataset(Dataset):
                 except Exception as e:
                     print(f"  Failed to cache reference patch: {e}")
 
-    def _get_or_extract_video_features(self, video_idx: int) -> torch.Tensor:
-        """Get cached features for all sampled frames of a video, or extract and cache them."""
+    def _get_or_extract_video_features(self, video_idx: int):
+        """Get cached features for all sampled frames of a video, or extract and cache them.
+        Returns: (features, cls_tokens) or just features if no CLS tokens available
+        """
         video_config = self.video_configs[video_idx]
         video_path = video_config.video_path
         metadata = self.video_metadata[video_idx]
 
         if metadata is None or metadata['num_windows'] == 0:
-            return torch.empty(0)
+            return torch.empty(0), torch.empty(0)
 
         cache_key = _get_video_cache_key(video_path, self.frame_sample_rate, self.dinov3_model)
 
@@ -631,7 +661,10 @@ class PredictionDataset(Dataset):
                 try:
                     cached = torch.load(cache_file, map_location='cpu', weights_only=False)
                     if cached['features'].shape[0] == metadata['num_sampled_frames']:
-                        return cached['features']
+                        cls_tokens = cached.get('cls_tokens', None)
+                        if cls_tokens is not None:
+                            return cached['features'], cls_tokens
+                        return cached['features'], torch.empty(0)
                 except Exception as e:
                     print(f"  Feature cache read failed: {e}")
 
@@ -640,52 +673,60 @@ class PredictionDataset(Dataset):
 
         cap = cv2.VideoCapture(video_path)
         features_list = []
+        cls_tokens_list = []
 
         for frame_idx in frame_indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             if not ret:
                 features_list.append(torch.zeros(14, 14, 768))
+                cls_tokens_list.append(torch.zeros(768))
                 continue
 
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
             frame = np.repeat(frame[..., None], 3, axis=-1)
 
-            features = self.dinov3_extractor.extract_frame_features(frame)
+            features, cls_token = self.dinov3_extractor.extract_frame_features(frame, return_cls=True)
             features_list.append(features)
+            cls_tokens_list.append(cls_token)
 
         cap.release()
 
         if not features_list:
-            return torch.empty(0)
+            return torch.empty(0), torch.empty(0)
 
         features = torch.stack(features_list)
+        cls_tokens = torch.stack(cls_tokens_list)
 
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             cache_file = self.cache_dir / f"{cache_key}_features.pt"
             try:
-                torch.save({'features': features, 'frame_indices': frame_indices}, cache_file)
-                print(f"  Cached features for video {video_idx}")
+                torch.save({'features': features, 'cls_tokens': cls_tokens, 'frame_indices': frame_indices}, cache_file)
+                print(f"  Cached features + CLS tokens for video {video_idx}")
             except Exception as e:
                 print(f"  Failed to cache features: {e}")
 
-        return features
+        return features, cls_tokens
 
-    def _process_video_windows(self, video_idx: int) -> torch.Tensor:
-        """Process a single video to generate all its windows from cached features."""
+    def _process_video_windows(self, video_idx: int):
+        """Process a single video to generate all its windows from cached features.
+        Returns: (windows, window_cls_tokens)
+        """
         video_config = self.video_configs[video_idx]
         video_path = video_config.video_path
         ref_patch = video_config.reference_patch
         metadata = self.video_metadata[video_idx]
 
         if metadata is None or metadata['num_windows'] == 0:
-            return torch.empty(0, self.window_size, self.max_patches_per_frame, 768)
+            return torch.empty(0, self.window_size, self.max_patches_per_frame, 768), \
+                   torch.empty(0, self.window_size, 768)
 
         ref_embedding = self.video_ref_patch_embeddings[video_idx]
         if ref_embedding is None:
-            return torch.empty(0, self.window_size, self.max_patches_per_frame, 768)
+            return torch.empty(0, self.window_size, self.max_patches_per_frame, 768), \
+                   torch.empty(0, self.window_size, 768)
 
         cache_key = _get_processed_cache_key(
             video_path, self.frame_sample_rate, self.dinov3_model,
@@ -698,13 +739,17 @@ class PredictionDataset(Dataset):
             if cache_file.exists():
                 try:
                     cached = torch.load(cache_file, map_location='cpu', weights_only=False)
-                    return cached['windows']
+                    windows = cached['windows']
+                    window_cls_tokens = cached.get('window_cls_tokens', torch.empty(0, self.window_size, 768))
+                    window_masks = cached.get('window_masks', torch.empty(0, self.window_size, self.max_patches_per_frame, dtype=torch.bool))
+                    return windows, window_cls_tokens, window_masks
                 except Exception as e:
                     print(f"  Full cache read failed: {e}")
 
-        features = self._get_or_extract_video_features(video_idx)
+        features, cls_tokens = self._get_or_extract_video_features(video_idx)
         if features.shape[0] == 0:
-            return torch.empty(0, self.window_size, self.max_patches_per_frame, 768)
+            return torch.empty(0, self.window_size, self.max_patches_per_frame, 768), \
+                   torch.empty(0, self.window_size, 768)
 
         selected_embeddings, _ = select_similar_patches(
             features,
@@ -725,15 +770,28 @@ class PredictionDataset(Dataset):
             stride=self.stride
         )
 
+        # Create CLS token windows (one CLS per frame in the window)
+        num_windows = windows.shape[0]
+        window_cls_tokens = torch.zeros(num_windows, self.window_size, 768)
+        for w in range(num_windows):
+            for t in range(self.window_size):
+                frame_idx = w * self.stride + t
+                if frame_idx < cls_tokens.shape[0]:
+                    window_cls_tokens[w, t] = cls_tokens[frame_idx]
+
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             cache_file = self.cache_dir / f"{cache_key}_full.pt"
             try:
-                torch.save({'windows': windows}, cache_file)
+                torch.save({
+                    'windows': windows,
+                    'window_cls_tokens': window_cls_tokens,
+                    'window_masks': window_masks
+                }, cache_file)
             except Exception as e:
                 print(f"  Failed to cache full windows: {e}")
 
-        return windows
+        return windows, window_cls_tokens, window_masks
 
     def __len__(self):
         return len(self.window_index)
@@ -745,6 +803,8 @@ class PredictionDataset(Dataset):
         if metadata is None or metadata['num_windows'] == 0:
             return {
                 'patch_embeddings': torch.zeros(self.window_size, self.max_patches_per_frame, 768),
+                'cls_tokens': torch.zeros(self.window_size, 768),
+                'patch_mask': torch.zeros(self.window_size, self.max_patches_per_frame, dtype=torch.bool),
                 'metadata': {
                     'video_idx': video_idx,
                     'video_path': self.video_configs[video_idx].video_path,
@@ -754,11 +814,13 @@ class PredictionDataset(Dataset):
                 }
             }
 
-        windows = self._process_video_windows(video_idx)
+        windows, window_cls_tokens, window_masks = self._process_video_windows(video_idx)
 
         if windows.shape[0] == 0:
             return {
                 'patch_embeddings': torch.zeros(self.window_size, self.max_patches_per_frame, 768),
+                'cls_tokens': torch.zeros(self.window_size, 768),
+                'patch_mask': torch.zeros(self.window_size, self.max_patches_per_frame, dtype=torch.bool),
                 'metadata': {
                     'video_idx': video_idx,
                     'video_path': self.video_configs[video_idx].video_path,
@@ -769,6 +831,8 @@ class PredictionDataset(Dataset):
             }
 
         window = windows[local_window_idx]
+        cls_tokens = window_cls_tokens[local_window_idx]
+        patch_mask = window_masks[local_window_idx]
 
         metadata_info = self.video_metadata[video_idx]
         frame_indices = metadata_info['frame_indices']
@@ -784,6 +848,8 @@ class PredictionDataset(Dataset):
 
         return {
             'patch_embeddings': window,
+            'cls_tokens': cls_tokens,
+            'patch_mask': patch_mask,
             'metadata': meta
         }
 

@@ -37,14 +37,16 @@ class DINOv3Extractor:
         print(f"DINOv3 loaded on {self.device}")
         print(f"Patch size: {self.patch_size}, Registers: {self.num_registers}, Embed dim: {self.embed_dim}")
 
-    def extract_frame_features(self, frame: np.ndarray) -> torch.Tensor:
+    def extract_frame_features(self, frame: np.ndarray, return_cls: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Extract normalized patch features from a single frame.
 
         Args:
             frame: H x W x 3 (RGB) numpy array (already converted to 3-channel if needed)
+            return_cls: If True, also return the CLS token embedding
         Returns:
-            patch_features: H_p x W_p x D tensor (normalized)
+            If return_cls=False: patch_features: H_p x W_p x D tensor (normalized)
+            If return_cls=True: (patch_features, cls_token) where cls_token is (D,)
         """
         # Handle grayscale input (convert to 3-channel)
         if frame.ndim == 2:
@@ -62,6 +64,10 @@ class DINOv3Extractor:
         with torch.no_grad():
             outputs = self.model(pixel_values=pixel_values)
 
+        # Extract CLS token (first token, index 0)
+        cls_token = outputs.last_hidden_state[:, 0, :]  # (1, D)
+        cls_token = F.normalize(cls_token, p=2, dim=-1)[0]  # (D,)
+
         # Remove CLS and register tokens
         patch_features = outputs.last_hidden_state[:, 1 + self.num_registers:, :]
 
@@ -74,14 +80,17 @@ class DINOv3Extractor:
         # Normalize features
         patch_features = F.normalize(patch_features, p=2, dim=-1)
 
+        if return_cls:
+            return patch_features.cpu(), cls_token.cpu()
         return patch_features.cpu()
 
     def extract_video_features(
         self,
         video_path: str,
         frame_indices: Optional[List[int]] = None,
-        sample_rate: int = 100
-    ) -> Tuple[torch.Tensor, List[int]]:
+        sample_rate: int = 100,
+        return_cls: bool = False
+    ) -> Union[Tuple[torch.Tensor, List[int]], Tuple[torch.Tensor, torch.Tensor, List[int]]]:
         """
         Extract features from video frames.
         Matches notebook: sample every N frames, convert to grayscale then 3-channel RGB.
@@ -90,9 +99,13 @@ class DINOv3Extractor:
             video_path: Path to video file
             frame_indices: Specific frame indices to extract (optional)
             sample_rate: Sample every N frames (if frame_indices not provided). Default 100 as in notebook.
+            return_cls: If True, also return CLS tokens for each frame
         Returns:
-            features: T x H_p x W_p x D tensor
-            extracted_indices: List of frame indices that were extracted
+            If return_cls=False: (features, extracted_indices)
+            If return_cls=True: (features, cls_tokens, extracted_indices)
+                features: T x H_p x W_p x D tensor
+                cls_tokens: T x D tensor
+                extracted_indices: List of frame indices that were extracted
         """
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -101,6 +114,7 @@ class DINOv3Extractor:
             frame_indices = list(range(0, total_frames, sample_rate))
 
         features_list = []
+        cls_tokens_list = []
         extracted_indices = []
 
         for idx in frame_indices:
@@ -116,18 +130,27 @@ class DINOv3Extractor:
             # Grayscale -> 3-channel RGB by repeating (as in notebook)
             frame = np.repeat(frame[..., None], 3, axis=-1)
 
-            features = self.extract_frame_features(frame)
-            features_list.append(features)
+            if return_cls:
+                features, cls_token = self.extract_frame_features(frame, return_cls=True)
+                features_list.append(features)
+                cls_tokens_list.append(cls_token)
+            else:
+                features = self.extract_frame_features(frame)
+                features_list.append(features)
             extracted_indices.append(idx)
 
         cap.release()
 
         if features_list:
             features = torch.stack(features_list)
+            if return_cls:
+                cls_tokens = torch.stack(cls_tokens_list)
+                return features, cls_tokens, extracted_indices
+            return features, extracted_indices
         else:
-            features = torch.empty(0)
-
-        return features, extracted_indices
+            if return_cls:
+                return torch.empty(0), torch.empty(0), []
+            return torch.empty(0), []
 
 
 def compute_similarity(

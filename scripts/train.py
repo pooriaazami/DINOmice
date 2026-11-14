@@ -226,11 +226,17 @@ def train_epoch(
     pbar = tqdm(loader, desc=f'Epoch {epoch} [Train]')
     for batch_idx, batch in enumerate(pbar):
         patch_embeddings = batch['patch_embeddings'].to(device)  # (B, W, P, D)
+        cls_tokens = batch.get('cls_tokens')
+        if cls_tokens is not None:
+            cls_tokens = cls_tokens.to(device)
+        patch_mask = batch.get('patch_mask')
+        if patch_mask is not None:
+            patch_mask = patch_mask.to(device)
         labels = batch['labels'].to(device)  # (B, num_behaviors)
 
         optimizer.zero_grad()
 
-        logits = model(patch_embeddings)
+        logits = model(patch_embeddings, cls_tokens=cls_tokens, patch_mask=patch_mask)
         loss = criterion(logits, labels)
 
         loss.backward()
@@ -291,9 +297,15 @@ def validate(
         pbar = tqdm(loader, desc=f'Epoch {epoch} [Val]')
         for batch_idx, batch in enumerate(pbar):
             patch_embeddings = batch['patch_embeddings'].to(device)
+            cls_tokens = batch.get('cls_tokens')
+            if cls_tokens is not None:
+                cls_tokens = cls_tokens.to(device)
+            patch_mask = batch.get('patch_mask')
+            if patch_mask is not None:
+                patch_mask = patch_mask.to(device)
             labels = batch['labels'].to(device)
 
-            logits = model(patch_embeddings)
+            logits = model(patch_embeddings, cls_tokens=cls_tokens, patch_mask=patch_mask)
             loss = criterion(logits, labels)
 
             total_loss += loss.item()
