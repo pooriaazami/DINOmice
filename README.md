@@ -1,9 +1,13 @@
 # DINOv3-based Behavior Classification Pipeline
 
-A PyTorch-based pipeline for multi-label behavior classification from videos using DINOv3 visual features and hierarchical GRU architecture.
+A PyTorch-based pipeline for multi-label behavior classification from videos using DINOv3 visual features with **two architecture options**:
+
+1. **Hierarchical GRU** (default): Patch GRU → Window GRU → Classifier
+2. **Flat Transformer**: All patches concatenated → Transformer Encoder → Classifier
 
 ## Pipeline Overview
 
+### GRU Architecture (Hierarchical)
 ```
 Video Frames → DINOv3 → Patch Features → Patch Selection → Patch GRU → Frame Embeddings
                                                                     ↓
@@ -12,13 +16,36 @@ Video Frames → DINOv3 → Patch Features → Patch Selection → Patch GRU →
                                                           FC Layers → Multi-label Output
 ```
 
+### Transformer Architecture (Flat)
+```
+Video Frames → DINOv3 → Patch Features → Patch Selection
+        ↓
+[Frame 1 Patches] [Frame 2 Patches] ... [Frame W Patches]
+        ↓                    ↓                    ↓
+    Concat all patches ──────────────────────────────→
+        ↓
+Add [CLS] Token + Positional Encoding
+        ↓
+Transformer Encoder (Multi-head Self-Attention)
+        ↓
+[CLS] Token / Mean Pooling → FC Layers → Multi-label Output
+```
+
 ### Key Components
 
+**GRU Architecture:**
 1. **DINOv3 Feature Extractor**: Extracts patch-level embeddings (14×14 grid, 768-dim) for each frame
 2. **Patch Selection**: For each frame, selects patches similar to a reference patch (from first frame) with configurable similarity threshold and border expansion
 3. **Patch GRU**: Processes selected patch embeddings in spatial order to create frame-level embeddings
 4. **Window GRU**: Processes sequence of frame embeddings over a temporal window
 5. **Classification Head**: Fully connected layers for multi-label behavior prediction
+
+**Transformer Architecture:**
+1. **DINOv3 Feature Extractor**: Extracts patch-level embeddings (14×14 grid, 768-dim) for each frame
+2. **Patch Selection**: For each frame, selects patches similar to a reference patch (from first frame) with configurable similarity threshold and border expansion
+3. **Patch Flattening**: Concatenates all selected patches from all frames in the window into a single sequence
+4. **Transformer Encoder**: Processes the sequence with self-attention, [CLS] token, and positional encoding
+5. **Classification Head**: Pooling (CLS/mean) → Fully connected layers for multi-label behavior prediction
 
 ## Installation
 
@@ -33,7 +60,8 @@ pip install -r requirements.txt
 
 Edit to define:
 - List of behavior classes
-- Model hyperparameters (GRU sizes, dropout, etc.)
+- **Model architecture**: `gru` (hierarchical) or `transformer` (flat)
+- Model hyperparameters (architecture-specific)
 - Training hyperparameters (learning rate, batch size, etc.)
 - Data parameters (frame sample rate)
 
@@ -46,25 +74,41 @@ behaviors:
   - "walking"
   - "resting"
   - "exploring"
+  - "digging"
+  - "climbing"
+  - "social_interaction"
 
 model:
+  # Architecture selection: 'gru' or 'transformer'
+  architecture: "gru"
   dinov3_model: "facebook/dinov3-vitb16-pretrain-lvd1689m"
-  window_size: 16
   patch_similarity_threshold: 0.80
   border_size: 1
-  patch_gru_hidden: 256
-  window_gru_hidden: 512
-  fc_hidden: 512
-  dropout: 0.3
-  bidirectional: true
+  window_size: 16
+  
+  # GRU architecture parameters (used when architecture: "gru")
+  gru_hidden_size: 256
+  gru_num_layers: 2
+  dropout: 0.2
+  fc_hidden_size: 128
+  
+  # Transformer architecture parameters (used when architecture: "transformer")
+  transformer_dim: 512
+  transformer_num_layers: 4
+  transformer_num_heads: 8
+  transformer_ff_dim: 2048
+  transformer_dropout: 0.1
+  transformer_use_cls_token: true
+  transformer_pool_type: "cls"  # 'cls' or 'mean'
 
 training:
-  batch_size: 8
+  batch_size: 4
   learning_rate: 1e-4
   num_epochs: 50
   weight_decay: 1e-5
   gradient_clip: 1.0
   early_stopping_patience: 10
+  num_workers: 4
 
 data:
   frame_sample_rate: 100
@@ -108,6 +152,32 @@ New JSON-based configuration for per-video reference patches and video-level spl
 **Key advantage**: Each video can have its own reference patch coordinates!
 
 See `configs/data_config_example.json` for a complete template.
+
+---
+
+## Architecture Comparison
+
+| Aspect | GRU (Hierarchical) | Transformer (Flat) |
+|--------|-------------------|-------------------|
+| **Processing** | Patch GRU → Window GRU (2 stages) | Single Transformer Encoder |
+| **Spatial-Temporal** | Separate (Patch GRU for spatial, Window GRU for temporal) | Joint (Self-attention over all patches × frames) |
+| **Parameters** | ~5M | ~13M |
+| **Memory** | Lower | Higher (attention over full sequence) |
+| **Sequence Length** | Fixed per stage | window_size × max_patches_per_frame |
+| **Best For** | Long sequences, limited GPU memory | Complex spatial-temporal interactions |
+| **Parallelization** | Limited (sequential GRU) | High (parallel attention) |
+
+**When to use GRU:**
+- Limited GPU memory
+- Long temporal windows (e.g., 32+ frames)
+- Faster training iteration speed needed
+
+**When to use Transformer:**
+- Complex behaviors requiring joint spatial-temporal reasoning
+- Sufficient GPU memory
+- Can benefit from parallel attention computation
+
+---
 
 ### 3. Label Format
 
@@ -160,6 +230,8 @@ data/
 Copy `configs/data_config_example.json` to `configs/data_config.json` and edit with your paths and per-video reference patches.
 
 ### 3. Train
+
+**GRU Architecture (default):**
 ```bash
 # Using main.py (unified CLI)
 python main.py train \
@@ -175,6 +247,27 @@ python scripts/train.py \
     --output-dir outputs/my_experiment \
     --experiment-name my_experiment
 ```
+
+**Transformer Architecture:**
+```bash
+# Using main.py (unified CLI)
+python main.py train \
+    --config configs/behaviors.yaml \
+    --data-config configs/data_config.json \
+    --output-dir outputs/my_experiment_transformer \
+    --experiment-name my_experiment_transformer \
+    --architecture transformer
+
+# Or directly with train.py
+python scripts/train.py \
+    --config configs/behaviors.yaml \
+    --data-config configs/data_config.json \
+    --output-dir outputs/my_experiment_transformer \
+    --experiment-name my_experiment_transformer \
+    --architecture transformer
+```
+
+**Or edit `configs/behaviors.yaml` to set `architecture: "transformer"` and use the default command.**
 
 ### 4. Monitor with TensorBoard
 ```bash
@@ -278,6 +371,7 @@ All scripts now use **hyphenated flags** (e.g., `--data-config`, `--reference-pa
 ### Model Override Arguments
 | Flag | Description |
 |------|-------------|
+| `--architecture` | Model architecture: `gru` (hierarchical) or `transformer` (flat) |
 | `--reference-patch` | Reference patch row col (legacy only) |
 | `--window-size` | Temporal window size |
 | `--similarity-threshold` | Patch similarity threshold (0-1) |
@@ -302,6 +396,8 @@ All scripts now use **hyphenated flags** (e.g., `--data-config`, `--reference-pa
 | `--experiment-name` | TensorBoard experiment name |
 | `--resume` | Checkpoint to resume from |
 | `--dinov3-model` | DINOv3 model name |
+| `--architecture` | Model architecture: `gru` or `transformer` |
+| `--test` / `--dry-run` | Single-batch test run for verification |
 
 ### Test Specific
 | Flag | Description |
@@ -352,9 +448,24 @@ All scripts now use **hyphenated flags** (e.g., `--data-config`, `--reference-pa
 ## Architecture Details
 
 ### Model: `models/behavior_classifier.py`
+
+**GRU Architecture (hierarchical):**
 - **PatchGRU**: Bidirectional GRU processing patches in spatial (row-major) order
 - **WindowGRU**: Bidirectional GRU processing frame embeddings temporally
 - **Classifier**: 3-layer MLP with dropout and ReLU
+
+**Transformer Architecture (flat):**
+- **Input Projection**: Linear layer (768 → transformer_dim)
+- **CLS Token**: Learnable classification token (optional)
+- **Positional Encoding**: Sinusoidal positional encoding
+- **Transformer Encoder**: Multi-layer with pre-norm, multi-head self-attention, GELU activation
+- **Pooling**: CLS token or mean pooling over valid tokens
+- **Classifier**: 2-layer MLP with LayerNorm, GELU, and Dropout
+
+Both architectures support:
+- Variable number of patches per frame (via padding + masking)
+- Multi-label classification with BCEWithLogitsLoss
+- Configurable hyperparameters via YAML config
 
 ### Feature Extraction: `utils/dinov3_extractor.py`
 - DINOv3 ViT-B/16 (patch size 16)
