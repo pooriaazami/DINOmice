@@ -17,6 +17,13 @@ Usage (legacy approach - single reference patch for all videos):
         --val-labels data/val_labels.json \
         --reference-patch 7 7 \
         --output-dir outputs/experiment1
+
+Test/Dry-run mode (single batch only):
+    python scripts/train.py \
+        --config configs/behaviors.yaml \
+        --data-config configs/data_config.json \
+        --output-dir outputs/test_run \
+        --test
 """
 
 import argparse
@@ -25,6 +32,7 @@ import sys
 import yaml
 import json
 import time
+import traceback
 from pathlib import Path
 from typing import List, Dict, Tuple
 
@@ -111,6 +119,10 @@ def parse_args():
     parser.add_argument('--dinov3-model', dest='dinov3_model', type=str, default=None,
                         help='DINOv3 model name')
 
+    # Test/Dry-run mode
+    parser.add_argument('--test', '--dry-run', dest='test_mode', action='store_true',
+                        help='Test mode: run only 1 batch for training and validation to verify code works')
+
     return parser.parse_args()
 
 
@@ -194,8 +206,11 @@ def train_epoch(
     optimizer: optim.Optimizer,
     device: torch.device,
     gradient_clip: float = 1.0,
-    epoch: int = 0
-) -> Tuple[float, Dict]:
+    epoch: int = 0,
+    writer: SummaryWriter = None,
+    global_step: int = 0,
+    test_mode: bool = False
+) -> Tuple[float, Dict, int]:
     """Train for one epoch."""
     model.train()
     total_loss = 0.0
@@ -203,7 +218,7 @@ def train_epoch(
     all_targets = []
 
     pbar = tqdm(loader, desc=f'Epoch {epoch} [Train]')
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar):
         patch_embeddings = batch['patch_embeddings'].to(device)  # (B, W, P, D)
         labels = batch['labels'].to(device)  # (B, num_behaviors)
 
@@ -221,6 +236,12 @@ def train_epoch(
 
         total_loss += loss.item()
 
+        # Batch-level TensorBoard logging
+        if writer is not None:
+            writer.add_scalar('Loss/train_batch', loss.item(), global_step)
+            # Log learning rate at batch level too
+            writer.add_scalar('LearningRate/batch', optimizer.param_groups[0]['lr'], global_step)
+
         # Store predictions
         preds = torch.sigmoid(logits).detach().cpu().numpy()
         all_preds.append(preds)
@@ -228,14 +249,20 @@ def train_epoch(
 
         pbar.set_postfix({'loss': loss.item()})
 
-    avg_loss = total_loss / len(loader)
+        global_step += 1
+
+        # Test mode: only process one batch
+        if test_mode:
+            break
+
+    avg_loss = total_loss / (batch_idx + 1)
     all_preds = np.vstack(all_preds)
     all_targets = np.vstack(all_targets)
 
     metrics = compute_metrics(all_preds, all_targets)
     metrics['loss'] = avg_loss
 
-    return avg_loss, metrics
+    return avg_loss, metrics, global_step
 
 
 def validate(
@@ -243,8 +270,11 @@ def validate(
     loader: torch.utils.data.DataLoader,
     criterion: nn.Module,
     device: torch.device,
-    epoch: int = 0
-) -> Tuple[float, Dict]:
+    epoch: int = 0,
+    writer: SummaryWriter = None,
+    global_step: int = 0,
+    test_mode: bool = False
+) -> Tuple[float, Dict, int]:
     """Validate model."""
     model.eval()
     total_loss = 0.0
@@ -253,7 +283,7 @@ def validate(
 
     with torch.no_grad():
         pbar = tqdm(loader, desc=f'Epoch {epoch} [Val]')
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             patch_embeddings = batch['patch_embeddings'].to(device)
             labels = batch['labels'].to(device)
 
@@ -262,20 +292,30 @@ def validate(
 
             total_loss += loss.item()
 
+            # Batch-level TensorBoard logging for validation
+            if writer is not None:
+                writer.add_scalar('Loss/val_batch', loss.item(), global_step)
+
             preds = torch.sigmoid(logits).cpu().numpy()
             all_preds.append(preds)
             all_targets.append(labels.cpu().numpy())
 
             pbar.set_postfix({'loss': loss.item()})
 
-    avg_loss = total_loss / len(loader)
+            global_step += 1
+
+            # Test mode: only process one batch
+            if test_mode:
+                break
+
+    avg_loss = total_loss / (batch_idx + 1)
     all_preds = np.vstack(all_preds)
     all_targets = np.vstack(all_targets)
 
     metrics = compute_metrics(all_preds, all_targets)
     metrics['loss'] = avg_loss
 
-    return avg_loss, metrics
+    return avg_loss, metrics, global_step
 
 
 def save_checkpoint(
@@ -285,9 +325,11 @@ def save_checkpoint(
     best_metric: float,
     config: Dict,
     output_dir: Path,
-    is_best: bool = False
+    is_best: bool = False,
+    max_retries: int = 3,
+    retry_delay: float = 1.0
 ):
-    """Save model checkpoint."""
+    """Save model checkpoint with retry logic for I/O errors."""
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -296,13 +338,35 @@ def save_checkpoint(
         'config': config
     }
 
-    # Save latest
-    torch.save(checkpoint, output_dir / 'checkpoint_latest.pth')
+    # Save latest with retry
+    for attempt in range(max_retries):
+        try:
+            torch.save(checkpoint, output_dir / 'checkpoint_latest.pth')
+            break
+        except (IOError, OSError, RuntimeError) as e:
+            if attempt < max_retries - 1:
+                print(f"  Warning: Checkpoint save failed (attempt {attempt + 1}/{max_retries}): {e}")
+                print(f"  Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+            else:
+                print(f"  Error: Failed to save latest checkpoint after {max_retries} attempts: {e}")
+                traceback.print_exc()
 
-    # Save best
+    # Save best with retry
     if is_best:
-        torch.save(checkpoint, output_dir / 'checkpoint_best.pth')
-        print(f"  Saved best model (macro_f1: {best_metric:.4f})")
+        for attempt in range(max_retries):
+            try:
+                torch.save(checkpoint, output_dir / 'checkpoint_best.pth')
+                print(f"  Saved best model (macro_f1: {best_metric:.4f})")
+                break
+            except (IOError, OSError, RuntimeError) as e:
+                if attempt < max_retries - 1:
+                    print(f"  Warning: Best checkpoint save failed (attempt {attempt + 1}/{max_retries}): {e}")
+                    print(f"  Retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                else:
+                    print(f"  Error: Failed to save best checkpoint after {max_retries} attempts: {e}")
+                    traceback.print_exc()
 
 
 def main():
@@ -425,6 +489,12 @@ def main():
     gradient_clip = float(config['training'].get('gradient_clip', 1.0))
 
     patience_counter = 0
+    global_step = 0
+
+    # Test mode: run only 1 epoch with 1 batch each
+    if args.test_mode:
+        num_epochs = 1
+        print(f"\n*** TEST/DRY-RUN MODE: Running only 1 epoch with 1 batch per phase ***")
 
     print(f"\nStarting training for {num_epochs} epochs...")
 
@@ -432,19 +502,21 @@ def main():
         epoch_start = time.time()
 
         # Train
-        train_loss, train_metrics = train_epoch(
+        train_loss, train_metrics, global_step = train_epoch(
             model, train_loader, criterion, optimizer, device,
-            gradient_clip=gradient_clip, epoch=epoch
+            gradient_clip=gradient_clip, epoch=epoch,
+            writer=writer, global_step=global_step, test_mode=args.test_mode
         )
 
         # Validate
-        val_loss, val_metrics = validate(
-            model, val_loader, criterion, device, epoch=epoch
+        val_loss, val_metrics, global_step = validate(
+            model, val_loader, criterion, device, epoch=epoch,
+            writer=writer, global_step=global_step, test_mode=args.test_mode
         )
 
         epoch_time = time.time() - epoch_start
 
-        # Log metrics
+        # Log epoch-level metrics
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/val', val_loss, epoch)
         writer.add_scalar('MacroF1/train', train_metrics['macro_f1'], epoch)
@@ -474,14 +546,20 @@ def main():
         else:
             patience_counter += 1
 
-        # Save checkpoint
-        save_checkpoint(
-            model, optimizer, epoch, best_macro_f1, config, output_dir, is_best
-        )
+        # Save checkpoint (skip in test mode unless it's the best)
+        if not args.test_mode or is_best:
+            save_checkpoint(
+                model, optimizer, epoch, best_macro_f1, config, output_dir, is_best
+            )
 
         # Early stopping
         if patience_counter >= early_stopping_patience:
             print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+            break
+
+        # Test mode: exit after first epoch
+        if args.test_mode:
+            print(f"\n*** TEST/DRY-RUN COMPLETE ***")
             break
 
     writer.close()

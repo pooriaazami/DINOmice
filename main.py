@@ -103,6 +103,8 @@ Examples (legacy approach - single reference patch for all videos):
     train_parser.add_argument('--resume', type=str, default=None)
     train_parser.add_argument('--device', type=str, default=None)
     train_parser.add_argument('--dinov3_model', type=str, default=None)
+    train_parser.add_argument('--test', '--dry-run', action='store_true',
+                              help='Test mode: run only 1 batch for training and validation to verify code works')
 
     # Test command
     test_parser = subparsers.add_parser('test', help='Test/evaluate the model')
@@ -188,7 +190,7 @@ def _args_to_argv(args, command):
         specific_args = ['train_videos', 'train_labels', 'val_videos', 'val_labels',
                          'batch_size', 'learning_rate', 'num_epochs', 'weight_decay',
                          'gradient_clip', 'early_stopping_patience', 'num_workers',
-                         'experiment_name', 'resume', 'dinov3_model']
+                         'experiment_name', 'resume', 'dinov3_model', 'test']
     elif command == 'test':
         specific_args = ['checkpoint', 'test_videos', 'test_labels', 'stride',
                          'threshold', 'batch_size', 'num_workers', 'plot_cm']
