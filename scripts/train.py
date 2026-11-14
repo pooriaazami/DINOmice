@@ -119,6 +119,10 @@ def parse_args():
     parser.add_argument('--dinov3-model', dest='dinov3_model', type=str, default=None,
                         help='DINOv3 model name')
 
+    # Architecture
+    parser.add_argument('--architecture', type=str, default=None, choices=['gru', 'transformer'],
+                        help='Model architecture: gru (hierarchical) or transformer (flat)')
+
     # Test/Dry-run mode
     parser.add_argument('--test', '--dry-run', dest='test_mode', action='store_true',
                         help='Test mode: run only 1 batch for training and validation to verify code works')
@@ -144,6 +148,8 @@ def merge_config(args, config: Dict) -> Dict:
         model_config['border_size'] = args.border_size
     if args.dinov3_model is not None:
         model_config['dinov3_model'] = args.dinov3_model
+    if args.architecture is not None:
+        model_config['architecture'] = args.architecture
 
     # Training config
     train_config = config.get('training', {})

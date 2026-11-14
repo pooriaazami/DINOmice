@@ -15,14 +15,27 @@ behaviors:
 
 # Model configuration defaults
 model:
+  # Architecture type: 'gru' or 'transformer'
+  architecture: "gru"
   dinov3_model: "facebook/dinov3-vitb16-pretrain-lvd1689m"
   patch_similarity_threshold: 0.80
   border_size: 1
   window_size: 16
+
+  # GRU architecture parameters
   gru_hidden_size: 256
   gru_num_layers: 2
   dropout: 0.2
   fc_hidden_size: 128
+
+  # Transformer architecture parameters
+  transformer_dim: 512
+  transformer_num_layers: 4
+  transformer_num_heads: 8
+  transformer_ff_dim: 2048
+  transformer_dropout: 0.1
+  transformer_use_cls_token: true
+  transformer_pool_type: "cls"  # 'cls' or 'mean'
 
 # Training configuration defaults
 training:
