@@ -492,11 +492,12 @@ class BehaviorDataset(Dataset):
             'last_frame_idx': frame_indices[end_frame - 1] if end_frame - 1 < len(frame_indices) else -1
         }
 
+        # Return numpy arrays to avoid shared memory issues with multiprocessing
         return {
-            'patch_embeddings': window,
-            'cls_tokens': window_cls_tokens,
-            'patch_mask': window_patch_mask,
-            'labels': label,
+            'patch_embeddings': window.numpy(),
+            'cls_tokens': window_cls_tokens.numpy(),
+            'patch_mask': window_patch_mask.numpy(),
+            'labels': label.numpy(),
             'metadata': metadata
         }
 
@@ -821,9 +822,9 @@ class PredictionDataset(Dataset):
 
         if padded_embeddings.shape[0] == 0:
             return {
-                'patch_embeddings': torch.zeros(self.window_size, self.max_patches_per_frame, 768),
-                'cls_tokens': torch.zeros(self.window_size, 768),
-                'patch_mask': torch.zeros(self.window_size, self.max_patches_per_frame, dtype=torch.bool),
+                'patch_embeddings': np.zeros((self.window_size, self.max_patches_per_frame, 768), dtype=np.float32),
+                'cls_tokens': np.zeros((self.window_size, 768), dtype=np.float32),
+                'patch_mask': np.zeros((self.window_size, self.max_patches_per_frame), dtype=bool),
                 'metadata': {
                     'video_idx': video_idx,
                     'video_path': self.video_configs[video_idx].video_path,
@@ -852,10 +853,11 @@ class PredictionDataset(Dataset):
             'frame_indices': frame_indices[start_frame:end_frame] if end_frame <= len(frame_indices) else []
         }
 
+        # Return numpy arrays to avoid shared memory issues with multiprocessing
         return {
-            'patch_embeddings': window,
-            'cls_tokens': window_cls_tokens,
-            'patch_mask': window_patch_mask,
+            'patch_embeddings': window.numpy(),
+            'cls_tokens': window_cls_tokens.numpy(),
+            'patch_mask': window_patch_mask.numpy(),
             'metadata': meta
         }
 

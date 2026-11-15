@@ -55,8 +55,8 @@ from torch.utils.data import DataLoader
 def custom_collate_fn(batch):
     """
     Custom collate function that avoids shared memory allocation.
-    Returns a dict of lists instead of stacked tensors.
-    Stacking is done in the main process.
+    Returns a dict of lists of numpy arrays.
+    Conversion to tensors is done in the main process using torch.from_numpy (zero-copy).
     """
     collated = {
         'patch_embeddings': [item['patch_embeddings'] for item in batch],
@@ -167,14 +167,14 @@ def predict(
 
     with torch.no_grad():
         for batch in tqdm(loader, desc='Predicting'):
-            # Stack lists into tensors (custom collate returns lists to avoid shared memory)
-            patch_embeddings = torch.stack(batch['patch_embeddings']).to(device)
+            # Convert numpy arrays to tensors using torch.from_numpy (zero-copy), then stack
+            patch_embeddings = torch.stack([torch.from_numpy(x) for x in batch['patch_embeddings']]).to(device)
             cls_tokens = batch.get('cls_tokens')
             if cls_tokens is not None:
-                cls_tokens = torch.stack(cls_tokens).to(device)
+                cls_tokens = torch.stack([torch.from_numpy(x) for x in cls_tokens]).to(device)
             patch_mask = batch.get('patch_mask')
             if patch_mask is not None:
-                patch_mask = torch.stack(patch_mask).to(device)
+                patch_mask = torch.stack([torch.from_numpy(x) for x in patch_mask]).to(device)
             metadata = batch['metadata']
 
             logits = model(patch_embeddings, cls_tokens=cls_tokens, patch_mask=patch_mask)

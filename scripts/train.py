@@ -69,10 +69,9 @@ from utils.data_config import load_data_config, create_data_config_from_lists
 def custom_collate_fn(batch):
     """
     Custom collate function that avoids shared memory allocation.
-    Returns a dict of lists instead of stacked tensors.
-    Stacking is done in the training loop (main process).
+    Returns a dict of lists of numpy arrays.
+    Conversion to tensors is done in the training loop (main process) using torch.from_numpy (zero-copy).
     """
-    # batch is a list of dicts, each dict has keys: patch_embeddings, cls_tokens, patch_mask, labels, metadata
     collated = {
         'patch_embeddings': [item['patch_embeddings'] for item in batch],
         'cls_tokens': [item['cls_tokens'] for item in batch],
@@ -254,15 +253,15 @@ def train_epoch(
 
     pbar = tqdm(loader, desc=f'Epoch {epoch} [Train]')
     for batch_idx, batch in enumerate(pbar):
-        # Stack lists into tensors (custom collate returns lists to avoid shared memory)
-        patch_embeddings = torch.stack(batch['patch_embeddings']).to(device)  # (B, W, P, D)
+        # Convert numpy arrays to tensors using torch.from_numpy (zero-copy), then stack
+        patch_embeddings = torch.stack([torch.from_numpy(x) for x in batch['patch_embeddings']]).to(device)
         cls_tokens = batch.get('cls_tokens')
         if cls_tokens is not None:
-            cls_tokens = torch.stack(cls_tokens).to(device)
+            cls_tokens = torch.stack([torch.from_numpy(x) for x in cls_tokens]).to(device)
         patch_mask = batch.get('patch_mask')
         if patch_mask is not None:
-            patch_mask = torch.stack(patch_mask).to(device)
-        labels = torch.stack(batch['labels']).to(device)  # (B, num_behaviors)
+            patch_mask = torch.stack([torch.from_numpy(x) for x in patch_mask]).to(device)
+        labels = torch.stack([torch.from_numpy(x) for x in batch['labels']]).to(device)
 
         optimizer.zero_grad()
 
@@ -326,15 +325,15 @@ def validate(
     with torch.no_grad():
         pbar = tqdm(loader, desc=f'Epoch {epoch} [Val]')
         for batch_idx, batch in enumerate(pbar):
-            # Stack lists into tensors (custom collate returns lists to avoid shared memory)
-            patch_embeddings = torch.stack(batch['patch_embeddings']).to(device)
+            # Convert numpy arrays to tensors using torch.from_numpy (zero-copy), then stack
+            patch_embeddings = torch.stack([torch.from_numpy(x) for x in batch['patch_embeddings']]).to(device)
             cls_tokens = batch.get('cls_tokens')
             if cls_tokens is not None:
-                cls_tokens = torch.stack(cls_tokens).to(device)
+                cls_tokens = torch.stack([torch.from_numpy(x) for x in cls_tokens]).to(device)
             patch_mask = batch.get('patch_mask')
             if patch_mask is not None:
-                patch_mask = torch.stack(patch_mask).to(device)
-            labels = torch.stack(batch['labels']).to(device)
+                patch_mask = torch.stack([torch.from_numpy(x) for x in patch_mask]).to(device)
+            labels = torch.stack([torch.from_numpy(x) for x in batch['labels']]).to(device)
 
             logits = model(patch_embeddings, cls_tokens=cls_tokens, patch_mask=patch_mask)
             loss = criterion(logits, labels)
