@@ -519,6 +519,10 @@ def main():
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time.time()
 
+        # Clear in-memory window cache at start of each epoch
+        train_loader.dataset.clear_epoch_cache()
+        val_loader.dataset.clear_epoch_cache()
+
         # Train
         train_loss, train_metrics, global_step = train_epoch(
             model, train_loader, criterion, optimizer, device,
