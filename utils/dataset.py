@@ -27,6 +27,10 @@ from utils.dinov3_extractor import (
 from utils.data_config import VideoConfig, DataConfig
 
 
+# Global cache for processed per-frame embeddings (avoids pickling issues with DataLoader workers)
+_PROCESSED_FRAMES_CACHE = {}
+
+
 def _get_video_cache_key(video_path: str, sample_rate: int, dinov3_model: str) -> str:
     """Generate a unique cache key for a video's raw features."""
     key_str = f"{video_path}_{sample_rate}_{dinov3_model}"
@@ -57,7 +61,7 @@ class BehaviorDataset(Dataset):
     """
     Dataset for behavior classification with efficient video-level caching.
     Extracts DINOv3 features for each video ONCE, caches to disk (float16).
-    Processes windows from cached features on-demand with in-memory caching per epoch.
+    Creates windows on-the-fly from cached features (fast CPU operations).
     """
 
     def __init__(
@@ -98,9 +102,6 @@ class BehaviorDataset(Dataset):
         self.video_metadata = []  # Per-video metadata
         self.video_labels = []  # Per-video labels (list per frame)
         self.video_ref_patch_embeddings = {}  # Cache for reference patch embeddings
-
-        # In-memory cache for processed windows (cleared each epoch)
-        self._video_windows_cache = {}  # video_idx -> (windows, window_labels, window_cls_tokens, window_masks)
 
         self._build_index()
 
@@ -167,10 +168,6 @@ class BehaviorDataset(Dataset):
 
         # Pre-extract reference patches for all videos (only first frame)
         self._precompute_reference_patches()
-
-    def clear_epoch_cache(self):
-        """Clear in-memory window cache at start of each epoch."""
-        self._video_windows_cache.clear()
 
     def _precompute_reference_patches(self):
         """Extract reference patch embedding from first frame of each video."""
@@ -356,15 +353,19 @@ class BehaviorDataset(Dataset):
 
         return features, cls_tokens
 
-    def _process_video_windows(self, video_idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _get_or_compute_processed_frames(self, video_idx: int):
         """
-        Process a single video to generate all its windows from cached features.
-        Uses in-memory cache to avoid re-processing within the same epoch.
-        Returns: (windows, window_labels, window_cls_tokens, window_masks)
+        Get or compute processed per-frame embeddings (after patch selection + padding).
+        Uses a global module-level cache to avoid pickling issues with DataLoader workers.
+        Returns: (padded_embeddings, patch_mask, cls_tokens, frame_indices, labels)
         """
-        # Check in-memory cache first
-        if video_idx in self._video_windows_cache:
-            return self._video_windows_cache[video_idx]
+        global _PROCESSED_FRAMES_CACHE
+
+        cache_key = (video_idx, self.frame_sample_rate, self.dinov3_model,
+                    self.similarity_threshold, self.border_size, self.max_patches_per_frame)
+
+        if cache_key in _PROCESSED_FRAMES_CACHE:
+            return _PROCESSED_FRAMES_CACHE[cache_key]
 
         video_config = self.video_configs[video_idx]
         video_path = video_config.video_path
@@ -373,30 +374,33 @@ class BehaviorDataset(Dataset):
         metadata = self.video_metadata[video_idx]
 
         if metadata is None or metadata['num_windows'] == 0:
-            result = (torch.empty(0, self.window_size, self.max_patches_per_frame, 768),
-                     torch.empty(0, self.num_behaviors),
-                     torch.empty(0, self.window_size, 768),
-                     torch.empty(0, self.window_size, self.max_patches_per_frame, dtype=torch.bool))
-            self._video_windows_cache[video_idx] = result
+            result = (torch.empty(0, self.max_patches_per_frame, 768),
+                     torch.empty(0, self.max_patches_per_frame, dtype=torch.bool),
+                     torch.empty(0, 768),
+                     [],
+                     labels)
+            _PROCESSED_FRAMES_CACHE[cache_key] = result
             return result
 
         ref_embedding = self.video_ref_patch_embeddings[video_idx]
         if ref_embedding is None:
-            result = (torch.empty(0, self.window_size, self.max_patches_per_frame, 768),
-                     torch.empty(0, self.num_behaviors),
-                     torch.empty(0, self.window_size, 768),
-                     torch.empty(0, self.window_size, self.max_patches_per_frame, dtype=torch.bool))
-            self._video_windows_cache[video_idx] = result
+            result = (torch.empty(0, self.max_patches_per_frame, 768),
+                     torch.empty(0, self.max_patches_per_frame, dtype=torch.bool),
+                     torch.empty(0, 768),
+                     [],
+                     labels)
+            _PROCESSED_FRAMES_CACHE[cache_key] = result
             return result
 
         # Get cached video features with CLS tokens
         features, cls_tokens = self._get_or_extract_video_features(video_idx)
         if features.shape[0] == 0:
-            result = (torch.empty(0, self.window_size, self.max_patches_per_frame, 768),
-                     torch.empty(0, self.num_behaviors),
-                     torch.empty(0, self.window_size, 768),
-                     torch.empty(0, self.window_size, self.max_patches_per_frame, dtype=torch.bool))
-            self._video_windows_cache[video_idx] = result
+            result = (torch.empty(0, self.max_patches_per_frame, 768),
+                     torch.empty(0, self.max_patches_per_frame, dtype=torch.bool),
+                     torch.empty(0, 768),
+                     metadata['frame_indices'],
+                     labels)
+            _PROCESSED_FRAMES_CACHE[cache_key] = result
             return result
 
         # Select similar patches for all frames
@@ -413,38 +417,63 @@ class BehaviorDataset(Dataset):
             max_patches=self.max_patches_per_frame
         )
 
-        # Create sliding windows
-        windows, window_masks = create_sliding_windows(
-            padded_embeddings,
-            patch_mask,
-            window_size=self.window_size,
-            stride=self.stride
-        )
-
-        # Create CLS token windows (one CLS per frame in the window)
-        num_windows = windows.shape[0]
-        window_cls_tokens = torch.zeros(num_windows, self.window_size, 768)
-        for w in range(num_windows):
-            for t in range(self.window_size):
-                frame_idx = w * self.stride + t
-                if frame_idx < cls_tokens.shape[0]:
-                    window_cls_tokens[w, t] = cls_tokens[frame_idx]
-
-        # Create labels for each window (label of the last frame in window)
         frame_indices = metadata['frame_indices']
-        window_labels = torch.zeros(num_windows, self.num_behaviors, dtype=torch.float32)
+        result = (padded_embeddings, patch_mask, cls_tokens, frame_indices, labels)
+        _PROCESSED_FRAMES_CACHE[cache_key] = result
+        return result
 
-        for w in range(num_windows):
-            last_frame_idx = frame_indices[w + self.window_size - 1]
+    def __getitem__(self, idx):
+        video_idx, local_window_idx = self.window_index[idx]
+
+        # Get processed per-frame data (cached globally)
+        padded_embeddings, patch_mask, cls_tokens, frame_indices, labels = self._get_or_compute_processed_frames(video_idx)
+
+        if padded_embeddings.shape[0] == 0:
+            return {
+                'patch_embeddings': torch.zeros(self.window_size, self.max_patches_per_frame, 768),
+                'cls_tokens': torch.zeros(self.window_size, 768),
+                'patch_mask': torch.zeros(self.window_size, self.max_patches_per_frame, dtype=torch.bool),
+                'labels': torch.zeros(self.num_behaviors, dtype=torch.float32),
+                'metadata': {
+                    'video_idx': video_idx,
+                    'video_path': self.video_configs[video_idx].video_path,
+                    'window_start_frame': -1,
+                    'last_frame_idx': -1
+                }
+            }
+
+        # Extract the specific window from the padded embeddings
+        start_frame = local_window_idx * self.stride
+        end_frame = start_frame + self.window_size
+
+        window = padded_embeddings[start_frame:end_frame]
+        window_patch_mask = patch_mask[start_frame:end_frame]
+        window_cls_tokens = cls_tokens[start_frame:end_frame]
+
+        # Create label for this window (label of the last frame in window)
+        label = torch.zeros(self.num_behaviors, dtype=torch.float32)
+        if end_frame - 1 < len(frame_indices):
+            last_frame_idx = frame_indices[end_frame - 1]
             if last_frame_idx < len(labels):
                 frame_labels = labels[last_frame_idx]
                 for behavior in frame_labels:
                     if behavior in self.behavior_to_idx:
-                        window_labels[w, self.behavior_to_idx[behavior]] = 1.0
+                        label[self.behavior_to_idx[behavior]] = 1.0
 
-        result = (windows, window_labels, window_cls_tokens, window_masks)
-        self._video_windows_cache[video_idx] = result  # Cache in memory for this epoch
-        return result
+        metadata = {
+            'video_idx': video_idx,
+            'video_path': self.video_configs[video_idx].video_path,
+            'window_start_frame': start_frame,
+            'last_frame_idx': frame_indices[end_frame - 1] if end_frame - 1 < len(frame_indices) else -1
+        }
+
+        return {
+            'patch_embeddings': window,
+            'cls_tokens': window_cls_tokens,
+            'patch_mask': window_patch_mask,
+            'labels': label,
+            'metadata': metadata
+        }
 
     def __len__(self):
         return len(self.window_index)
