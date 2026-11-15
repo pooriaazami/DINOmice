@@ -169,6 +169,31 @@ class BehaviorDataset(Dataset):
         # Pre-extract reference patches for all videos (only first frame)
         self._precompute_reference_patches()
 
+    def precompute_all_features(self):
+        """
+        Pre-extract and cache features for ALL videos in this dataset.
+        Call this in the main process BEFORE creating DataLoader to avoid
+        feature extraction in worker processes (which causes CUDA/shared memory issues).
+        """
+        print(f"Pre-computing features for {len(self.video_configs)} videos...")
+        for video_idx in range(len(self.video_configs)):
+            metadata = self.video_metadata[video_idx]
+            if metadata is None or metadata['num_windows'] == 0:
+                continue
+
+            # This will extract and cache features if not already cached
+            self._get_or_extract_video_features(video_idx)
+
+            # Also pre-compute processed frames (patch selection + padding)
+            # This uses the global cache, so it's fast after first run
+            self._get_or_compute_processed_frames(video_idx)
+
+        print(f"Feature pre-computation complete for all videos.")
+
+        # After pre-computation, we don't need the extractor in workers
+        # Set to None to avoid pickling the DINOv3 model (which causes CUDA issues)
+        self.dinov3_extractor = None
+
     def _precompute_reference_patches(self):
         """Extract reference patch embedding from first frame of each video."""
         for video_idx, video_config in enumerate(self.video_configs):
@@ -624,6 +649,29 @@ class PredictionDataset(Dataset):
                     torch.save({'ref_patch_embedding': ref_embedding, 'ref_patch_used': (ref_row, ref_col)}, cache_file)
                 except Exception as e:
                     print(f"  Failed to cache reference patch: {e}")
+
+    def precompute_all_features(self):
+        """
+        Pre-extract and cache features for ALL videos in this dataset.
+        Call this in the main process BEFORE creating DataLoader to avoid
+        feature extraction in worker processes (which causes CUDA/shared memory issues).
+        """
+        print(f"Pre-computing features for {len(self.video_configs)} videos...")
+        for video_idx in range(len(self.video_configs)):
+            metadata = self.video_metadata[video_idx]
+            if metadata is None or metadata['num_windows'] == 0:
+                continue
+
+            # This will extract and cache features if not already cached
+            self._get_or_extract_video_features(video_idx)
+
+            # Also pre-compute processed frames (patch selection + padding)
+            self._get_or_compute_processed_frames(video_idx)
+
+        print(f"Feature pre-computation complete for all videos.")
+
+        # After pre-computation, we don't need the extractor in workers
+        self.dinov3_extractor = None
 
     def _get_or_extract_video_features(self, video_idx: int):
         """Get cached features for all sampled frames of a video, or extract and cache them.

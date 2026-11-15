@@ -441,6 +441,8 @@ def main():
 
     # Create test dataset
     combined_config = {**config['training'], **config['model'], **config['data']}
+    cache_dir = args.output_dir + '/cache' if args.output_dir else None
+
     test_dataset = BehaviorDataset(
         video_configs=test_configs,
         behavior_list=behavior_list,
@@ -451,8 +453,13 @@ def main():
         border_size=config['model'].get('border_size', 1),
         max_patches_per_frame=args.max_patches_per_frame,
         frame_sample_rate=config['data'].get('frame_sample_rate', 100),
+        cache_dir=cache_dir,
         mode='test'
     )
+
+    # Pre-compute all features in main process to avoid CUDA/shared memory issues in workers
+    print("\nPre-computing features for test set...")
+    test_dataset.precompute_all_features()
 
     test_loader = DataLoader(
         test_dataset,

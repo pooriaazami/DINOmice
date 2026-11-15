@@ -51,6 +51,7 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import f1_score, classification_report
 import numpy as np
@@ -61,7 +62,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from models.behavior_classifier import BehaviorClassifier, create_model_from_config
 from utils.dinov3_extractor import DINOv3Extractor
-from utils.dataset import create_data_loaders_from_config, create_data_loaders
+from utils.dataset import BehaviorDataset, create_data_loaders_from_config, create_data_loaders
 from utils.data_config import load_data_config, create_data_config_from_lists
 
 
@@ -468,16 +469,65 @@ def main():
 
     # Create data loaders
     combined_config = {**config['training'], **config['model'], **config['data']}
-    train_loader, val_loader = create_data_loaders_from_config(
-        data_config=data_config,
+    cache_dir = args.output_dir + '/cache' if args.output_dir else None
+
+    # Create datasets first
+    from utils.dataset import BehaviorDataset
+    train_dataset = BehaviorDataset(
+        video_configs=data_config.train,
         behavior_list=behavior_list,
         dinov3_extractor=dinov3_extractor,
-        config=combined_config,
-        cache_dir=args.output_dir + '/cache' if args.output_dir else None
+        window_size=combined_config.get('window_size', 16),
+        stride=combined_config.get('stride', 1),
+        similarity_threshold=combined_config.get('patch_similarity_threshold', 0.80),
+        border_size=combined_config.get('border_size', 1),
+        max_patches_per_frame=combined_config.get('max_patches_per_frame', 50),
+        frame_sample_rate=combined_config.get('frame_sample_rate', 100),
+        cache_dir=cache_dir,
+        mode='train'
     )
 
-    print(f"Train windows: {len(train_loader.dataset)}")
-    print(f"Val windows: {len(val_loader.dataset)}")
+    val_dataset = BehaviorDataset(
+        video_configs=data_config.val,
+        behavior_list=behavior_list,
+        dinov3_extractor=dinov3_extractor,
+        window_size=combined_config.get('window_size', 16),
+        stride=combined_config.get('stride', 1),
+        similarity_threshold=combined_config.get('patch_similarity_threshold', 0.80),
+        border_size=combined_config.get('border_size', 1),
+        max_patches_per_frame=combined_config.get('max_patches_per_frame', 50),
+        frame_sample_rate=combined_config.get('frame_sample_rate', 100),
+        cache_dir=cache_dir,
+        mode='val'
+    )
+
+    # Pre-compute all features in main process to avoid CUDA/shared memory issues in workers
+    print("\nPre-computing features for training set...")
+    train_dataset.precompute_all_features()
+    print("\nPre-computing features for validation set...")
+    val_dataset.precompute_all_features()
+
+    # Create data loaders (extractor is now None in datasets, avoiding pickling issues)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=combined_config.get('batch_size', 4),
+        shuffle=True,
+        num_workers=combined_config.get('num_workers', 4),
+        pin_memory=True,
+        drop_last=True
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=combined_config.get('batch_size', 4),
+        shuffle=False,
+        num_workers=combined_config.get('num_workers', 4),
+        pin_memory=True,
+        drop_last=False
+    )
+
+    print(f"Train windows: {len(train_dataset)}")
+    print(f"Val windows: {len(val_dataset)}")
 
     # Loss and optimizer
     criterion = nn.BCEWithLogitsLoss()

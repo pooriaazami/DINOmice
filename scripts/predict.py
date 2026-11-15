@@ -321,6 +321,8 @@ def main():
 
     # Create prediction dataset
     combined_config = {**config['model'], **config.get('data', {})}
+    cache_dir = args.output_dir + '/cache' if args.output_dir else None
+
     dataset = PredictionDataset(
         video_configs=predict_configs,
         dinov3_extractor=dinov3_extractor,
@@ -329,8 +331,13 @@ def main():
         similarity_threshold=config['model'].get('patch_similarity_threshold', 0.80),
         border_size=config['model'].get('border_size', 1),
         max_patches_per_frame=args.max_patches_per_frame,
-        frame_sample_rate=config['data'].get('frame_sample_rate', 100)
+        frame_sample_rate=config['data'].get('frame_sample_rate', 100),
+        cache_dir=cache_dir
     )
+
+    # Pre-compute all features in main process to avoid CUDA/shared memory issues in workers
+    print("\nPre-computing features for prediction set...")
+    dataset.precompute_all_features()
 
     loader = DataLoader(
         dataset,
