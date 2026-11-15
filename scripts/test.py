@@ -29,7 +29,15 @@ import torch.multiprocessing as mp
 from pathlib import Path
 from typing import List, Dict, Tuple
 
+# Set multiprocessing settings BEFORE importing torch
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass
+
 import torch
+torch.multiprocessing.set_sharing_strategy('file_system')
+
 import torch.nn as nn
 import numpy as np
 import pandas as pd
@@ -377,11 +385,6 @@ def save_results(
 
 
 def main():
-    # Must set spawn method before any CUDA operations for DataLoader workers
-    mp.set_start_method('spawn', force=True)
-    # Use file system sharing strategy to avoid shared memory limits with CUDA tensors
-    torch.multiprocessing.set_sharing_strategy('file_system')
-
     args = parse_args()
 
     # Load and merge config
