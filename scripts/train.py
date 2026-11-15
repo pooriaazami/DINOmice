@@ -66,6 +66,23 @@ from utils.dataset import BehaviorDataset, create_data_loaders_from_config, crea
 from utils.data_config import load_data_config, create_data_config_from_lists
 
 
+def custom_collate_fn(batch):
+    """
+    Custom collate function that avoids shared memory allocation.
+    Returns a dict of lists instead of stacked tensors.
+    Stacking is done in the training loop (main process).
+    """
+    # batch is a list of dicts, each dict has keys: patch_embeddings, cls_tokens, patch_mask, labels, metadata
+    collated = {
+        'patch_embeddings': [item['patch_embeddings'] for item in batch],
+        'cls_tokens': [item['cls_tokens'] for item in batch],
+        'patch_mask': [item['patch_mask'] for item in batch],
+        'labels': [item['labels'] for item in batch],
+        'metadata': [item['metadata'] for item in batch],
+    }
+    return collated
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train DINOv3-based Behavior Classifier')
 
@@ -237,14 +254,15 @@ def train_epoch(
 
     pbar = tqdm(loader, desc=f'Epoch {epoch} [Train]')
     for batch_idx, batch in enumerate(pbar):
-        patch_embeddings = batch['patch_embeddings'].to(device)  # (B, W, P, D)
+        # Stack lists into tensors (custom collate returns lists to avoid shared memory)
+        patch_embeddings = torch.stack(batch['patch_embeddings']).to(device)  # (B, W, P, D)
         cls_tokens = batch.get('cls_tokens')
         if cls_tokens is not None:
-            cls_tokens = cls_tokens.to(device)
+            cls_tokens = torch.stack(cls_tokens).to(device)
         patch_mask = batch.get('patch_mask')
         if patch_mask is not None:
-            patch_mask = patch_mask.to(device)
-        labels = batch['labels'].to(device)  # (B, num_behaviors)
+            patch_mask = torch.stack(patch_mask).to(device)
+        labels = torch.stack(batch['labels']).to(device)  # (B, num_behaviors)
 
         optimizer.zero_grad()
 
@@ -308,14 +326,15 @@ def validate(
     with torch.no_grad():
         pbar = tqdm(loader, desc=f'Epoch {epoch} [Val]')
         for batch_idx, batch in enumerate(pbar):
-            patch_embeddings = batch['patch_embeddings'].to(device)
+            # Stack lists into tensors (custom collate returns lists to avoid shared memory)
+            patch_embeddings = torch.stack(batch['patch_embeddings']).to(device)
             cls_tokens = batch.get('cls_tokens')
             if cls_tokens is not None:
-                cls_tokens = cls_tokens.to(device)
+                cls_tokens = torch.stack(cls_tokens).to(device)
             patch_mask = batch.get('patch_mask')
             if patch_mask is not None:
-                patch_mask = patch_mask.to(device)
-            labels = batch['labels'].to(device)
+                patch_mask = torch.stack(patch_mask).to(device)
+            labels = torch.stack(batch['labels']).to(device)
 
             logits = model(patch_embeddings, cls_tokens=cls_tokens, patch_mask=patch_mask)
             loss = criterion(logits, labels)
@@ -509,13 +528,15 @@ def main():
 
     # Create data loaders (extractor is now None in datasets, avoiding pickling issues)
     # pin_memory=False to avoid shared memory allocation issues with large tensors
+    # Use custom collate function to avoid shared memory during inter-process transfer
     train_loader = DataLoader(
         train_dataset,
         batch_size=combined_config.get('batch_size', 4),
         shuffle=True,
         num_workers=combined_config.get('num_workers', 4),
         pin_memory=False,
-        drop_last=True
+        drop_last=True,
+        collate_fn=custom_collate_fn
     )
 
     val_loader = DataLoader(
@@ -524,7 +545,8 @@ def main():
         shuffle=False,
         num_workers=combined_config.get('num_workers', 4),
         pin_memory=False,
-        drop_last=False
+        drop_last=False,
+        collate_fn=custom_collate_fn
     )
 
     print(f"Train windows: {len(train_dataset)}")

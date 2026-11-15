@@ -52,6 +52,21 @@ from utils.data_config import load_data_config, create_data_config_from_lists
 from torch.utils.data import DataLoader
 
 
+def custom_collate_fn(batch):
+    """
+    Custom collate function that avoids shared memory allocation.
+    Returns a dict of lists instead of stacked tensors.
+    Stacking is done in the main process.
+    """
+    collated = {
+        'patch_embeddings': [item['patch_embeddings'] for item in batch],
+        'cls_tokens': [item['cls_tokens'] for item in batch],
+        'patch_mask': [item['patch_mask'] for item in batch],
+        'metadata': [item['metadata'] for item in batch],
+    }
+    return collated
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Predict behaviors using trained DINOv3-based classifier')
 
@@ -152,13 +167,14 @@ def predict(
 
     with torch.no_grad():
         for batch in tqdm(loader, desc='Predicting'):
-            patch_embeddings = batch['patch_embeddings'].to(device)
+            # Stack lists into tensors (custom collate returns lists to avoid shared memory)
+            patch_embeddings = torch.stack(batch['patch_embeddings']).to(device)
             cls_tokens = batch.get('cls_tokens')
             if cls_tokens is not None:
-                cls_tokens = cls_tokens.to(device)
+                cls_tokens = torch.stack(cls_tokens).to(device)
             patch_mask = batch.get('patch_mask')
             if patch_mask is not None:
-                patch_mask = patch_mask.to(device)
+                patch_mask = torch.stack(patch_mask).to(device)
             metadata = batch['metadata']
 
             logits = model(patch_embeddings, cls_tokens=cls_tokens, patch_mask=patch_mask)
@@ -344,7 +360,8 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=False
+        pin_memory=False,
+        collate_fn=custom_collate_fn
     )
 
     print(f"Total prediction windows: {len(dataset)}")
