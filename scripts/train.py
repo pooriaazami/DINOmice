@@ -508,12 +508,13 @@ def main():
     val_dataset.precompute_all_features()
 
     # Create data loaders (extractor is now None in datasets, avoiding pickling issues)
+    # pin_memory=False to avoid shared memory allocation issues with large tensors
     train_loader = DataLoader(
         train_dataset,
         batch_size=combined_config.get('batch_size', 4),
         shuffle=True,
         num_workers=combined_config.get('num_workers', 4),
-        pin_memory=True,
+        pin_memory=False,
         drop_last=True
     )
 
@@ -522,7 +523,7 @@ def main():
         batch_size=combined_config.get('batch_size', 4),
         shuffle=False,
         num_workers=combined_config.get('num_workers', 4),
-        pin_memory=True,
+        pin_memory=False,
         drop_last=False
     )
 
