@@ -36,6 +36,8 @@ import traceback
 from pathlib import Path
 from typing import List, Dict, Tuple
 
+import torch.multiprocessing as mp
+
 # Set multiprocessing settings BEFORE importing torch
 # This must be done at module level, before any torch operations
 try:
@@ -49,7 +51,6 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 
 import torch.nn as nn
 import torch.optim as optim
-import torch.multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import f1_score, classification_report
 import numpy as np
