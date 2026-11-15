@@ -478,51 +478,6 @@ class BehaviorDataset(Dataset):
     def __len__(self):
         return len(self.window_index)
 
-    def __getitem__(self, idx):
-        video_idx, local_window_idx = self.window_index[idx]
-
-        # Process video windows on demand (or load from cache)
-        windows, window_labels, window_cls_tokens, window_masks = self._process_video_windows(video_idx)
-
-        if windows.shape[0] == 0:
-            return {
-                'patch_embeddings': torch.zeros(self.window_size, self.max_patches_per_frame, 768),
-                'cls_tokens': torch.zeros(self.window_size, 768),
-                'patch_mask': torch.zeros(self.window_size, self.max_patches_per_frame, dtype=torch.bool),
-                'labels': torch.zeros(self.num_behaviors, dtype=torch.float32),
-                'metadata': {
-                    'video_idx': video_idx,
-                    'video_path': self.video_configs[video_idx].video_path,
-                    'window_start_frame': -1,
-                    'last_frame_idx': -1
-                }
-            }
-
-        window = windows[local_window_idx]
-        cls_tokens = window_cls_tokens[local_window_idx]
-        patch_mask = window_masks[local_window_idx]
-        label = window_labels[local_window_idx]
-
-        # Get frame indices for metadata
-        metadata_info = self.video_metadata[video_idx]
-        frame_indices = metadata_info['frame_indices']
-        last_frame_idx = frame_indices[local_window_idx + self.window_size - 1] if local_window_idx + self.window_size - 1 < len(frame_indices) else -1
-
-        metadata = {
-            'video_idx': video_idx,
-            'video_path': self.video_configs[video_idx].video_path,
-            'window_start_frame': local_window_idx * self.stride,
-            'last_frame_idx': last_frame_idx
-        }
-
-        return {
-            'patch_embeddings': window,
-            'cls_tokens': cls_tokens,
-            'patch_mask': patch_mask,
-            'labels': label,
-            'metadata': metadata
-        }
-
 
 class PredictionDataset(Dataset):
     """
@@ -559,9 +514,6 @@ class PredictionDataset(Dataset):
         self.video_window_counts = []
         self.video_metadata = []
         self.video_ref_patch_embeddings = {}
-
-        # In-memory cache for processed windows
-        self._video_windows_cache = {}
 
         self._build_index()
         self._precompute_reference_patches()
@@ -745,14 +697,19 @@ class PredictionDataset(Dataset):
 
         return features, cls_tokens
 
-    def _process_video_windows(self, video_idx: int):
-        """Process a single video to generate all its windows from cached features.
-        Uses in-memory cache to avoid re-processing.
-        Returns: (windows, window_cls_tokens, window_masks)
+    def _get_or_compute_processed_frames(self, video_idx: int):
         """
-        # Check in-memory cache first
-        if video_idx in self._video_windows_cache:
-            return self._video_windows_cache[video_idx]
+        Get or compute processed per-frame embeddings (after patch selection + padding).
+        Uses a global module-level cache to avoid pickling issues with DataLoader workers.
+        Returns: (padded_embeddings, patch_mask, cls_tokens, frame_indices)
+        """
+        global _PROCESSED_FRAMES_CACHE
+
+        cache_key = (video_idx, self.frame_sample_rate, self.dinov3_model,
+                    self.similarity_threshold, self.border_size, self.max_patches_per_frame)
+
+        if cache_key in _PROCESSED_FRAMES_CACHE:
+            return _PROCESSED_FRAMES_CACHE[cache_key]
 
         video_config = self.video_configs[video_idx]
         video_path = video_config.video_path
@@ -760,27 +717,30 @@ class PredictionDataset(Dataset):
         metadata = self.video_metadata[video_idx]
 
         if metadata is None or metadata['num_windows'] == 0:
-            result = (torch.empty(0, self.window_size, self.max_patches_per_frame, 768),
-                     torch.empty(0, self.window_size, 768),
-                     torch.empty(0, self.window_size, self.max_patches_per_frame, dtype=torch.bool))
-            self._video_windows_cache[video_idx] = result
+            result = (torch.empty(0, self.max_patches_per_frame, 768),
+                     torch.empty(0, self.max_patches_per_frame, dtype=torch.bool),
+                     torch.empty(0, 768),
+                     [])
+            _PROCESSED_FRAMES_CACHE[cache_key] = result
             return result
 
         ref_embedding = self.video_ref_patch_embeddings[video_idx]
         if ref_embedding is None:
-            result = (torch.empty(0, self.window_size, self.max_patches_per_frame, 768),
-                     torch.empty(0, self.window_size, 768),
-                     torch.empty(0, self.window_size, self.max_patches_per_frame, dtype=torch.bool))
-            self._video_windows_cache[video_idx] = result
+            result = (torch.empty(0, self.max_patches_per_frame, 768),
+                     torch.empty(0, self.max_patches_per_frame, dtype=torch.bool),
+                     torch.empty(0, 768),
+                     [])
+            _PROCESSED_FRAMES_CACHE[cache_key] = result
             return result
 
         # Get cached video features with CLS tokens
         features, cls_tokens = self._get_or_extract_video_features(video_idx)
         if features.shape[0] == 0:
-            result = (torch.empty(0, self.window_size, self.max_patches_per_frame, 768),
-                     torch.empty(0, self.window_size, 768),
-                     torch.empty(0, self.window_size, self.max_patches_per_frame, dtype=torch.bool))
-            self._video_windows_cache[video_idx] = result
+            result = (torch.empty(0, self.max_patches_per_frame, 768),
+                     torch.empty(0, self.max_patches_per_frame, dtype=torch.bool),
+                     torch.empty(0, 768),
+                     metadata['frame_indices'])
+            _PROCESSED_FRAMES_CACHE[cache_key] = result
             return result
 
         # Select similar patches for all frames
@@ -797,25 +757,9 @@ class PredictionDataset(Dataset):
             max_patches=self.max_patches_per_frame
         )
 
-        # Create sliding windows
-        windows, window_masks = create_sliding_windows(
-            padded_embeddings,
-            patch_mask,
-            window_size=self.window_size,
-            stride=self.stride
-        )
-
-        # Create CLS token windows (one CLS per frame in the window)
-        num_windows = windows.shape[0]
-        window_cls_tokens = torch.zeros(num_windows, self.window_size, 768)
-        for w in range(num_windows):
-            for t in range(self.window_size):
-                frame_idx = w * self.stride + t
-                if frame_idx < cls_tokens.shape[0]:
-                    window_cls_tokens[w, t] = cls_tokens[frame_idx]
-
-        result = (windows, window_cls_tokens, window_masks)
-        self._video_windows_cache[video_idx] = result  # Cache in memory
+        frame_indices = metadata['frame_indices']
+        result = (padded_embeddings, patch_mask, cls_tokens, frame_indices)
+        _PROCESSED_FRAMES_CACHE[cache_key] = result
         return result
 
     def __len__(self):
@@ -824,8 +768,10 @@ class PredictionDataset(Dataset):
     def __getitem__(self, idx):
         video_idx, local_window_idx = self.window_index[idx]
 
-        metadata = self.video_metadata[video_idx]
-        if metadata is None or metadata['num_windows'] == 0:
+        # Get processed per-frame data (cached globally)
+        padded_embeddings, patch_mask, cls_tokens, frame_indices = self._get_or_compute_processed_frames(video_idx)
+
+        if padded_embeddings.shape[0] == 0:
             return {
                 'patch_embeddings': torch.zeros(self.window_size, self.max_patches_per_frame, 768),
                 'cls_tokens': torch.zeros(self.window_size, 768),
@@ -839,42 +785,29 @@ class PredictionDataset(Dataset):
                 }
             }
 
-        windows, window_cls_tokens, window_masks = self._process_video_windows(video_idx)
+        # Extract the specific window from the padded embeddings
+        start_frame = local_window_idx * self.stride
+        end_frame = start_frame + self.window_size
 
-        if windows.shape[0] == 0:
-            return {
-                'patch_embeddings': torch.zeros(self.window_size, self.max_patches_per_frame, 768),
-                'cls_tokens': torch.zeros(self.window_size, 768),
-                'patch_mask': torch.zeros(self.window_size, self.max_patches_per_frame, dtype=torch.bool),
-                'metadata': {
-                    'video_idx': video_idx,
-                    'video_path': self.video_configs[video_idx].video_path,
-                    'window_start_frame': -1,
-                    'last_frame_idx': -1,
-                    'frame_indices': []
-                }
-            }
-
-        window = windows[local_window_idx]
-        cls_tokens = window_cls_tokens[local_window_idx]
-        patch_mask = window_masks[local_window_idx]
+        window = padded_embeddings[start_frame:end_frame]
+        window_patch_mask = patch_mask[start_frame:end_frame]
+        window_cls_tokens = cls_tokens[start_frame:end_frame]
 
         metadata_info = self.video_metadata[video_idx]
-        frame_indices = metadata_info['frame_indices']
-        last_frame_idx = frame_indices[local_window_idx + self.window_size - 1] if local_window_idx + self.window_size - 1 < len(frame_indices) else -1
+        last_frame_idx = frame_indices[end_frame - 1] if end_frame - 1 < len(frame_indices) else -1
 
         meta = {
             'video_idx': video_idx,
             'video_path': self.video_configs[video_idx].video_path,
-            'window_start_frame': local_window_idx * self.stride,
+            'window_start_frame': start_frame,
             'last_frame_idx': last_frame_idx,
-            'frame_indices': frame_indices[local_window_idx:local_window_idx + self.window_size] if local_window_idx + self.window_size <= len(frame_indices) else []
+            'frame_indices': frame_indices[start_frame:end_frame] if end_frame <= len(frame_indices) else []
         }
 
         return {
             'patch_embeddings': window,
-            'cls_tokens': cls_tokens,
-            'patch_mask': patch_mask,
+            'cls_tokens': window_cls_tokens,
+            'patch_mask': window_patch_mask,
             'metadata': meta
         }
 
